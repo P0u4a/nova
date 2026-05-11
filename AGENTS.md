@@ -1,0 +1,19 @@
+# Nova Guidelines
+
+This project uses Zig version 0.16
+
+Always consult the clean-code skill when writing code.
+
+## Building the TUI
+
+We use libvaxis vxfw for building the TUI. The source code for this library is inside zig-pkg.
+
+Prefer to use the primitives provided by the framework as much as possible.
+
+## Verifying
+
+Run the following:
+
+- `zig build test`
+
+- `zig build run`

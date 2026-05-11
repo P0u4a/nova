@@ -1,0 +1,10 @@
+.zig-cache/
+zig-cache/
+zig-out/
+*.o
+zig-pkg/
+
+# Py
+__pycache__
+
+examples/
