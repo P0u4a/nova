@@ -35,22 +35,23 @@ pub const App = struct {
         .wheel_scroll = 4,
     },
 
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent, fw_app: ?*vxfw.App) App {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, agent: *agent_mod.Agent) App {
         return .{
             .io = io,
             .gpa = gpa,
             .agent = agent,
             .input = .init(gpa),
             .worker_context = .{
+                .io = io,
                 .gpa = agent.gpa,
                 .agent = agent,
-                .fw_app = fw_app,
             },
         };
     }
 
     pub fn deinit(self: *App) void {
         self.awaitTurn();
+        self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
         self.tool_indexes.deinit(self.gpa);
         self.transcript.deinit(self.gpa);
         self.input.deinit();
@@ -343,10 +344,49 @@ fn chooseLoadingWordIndex(io: std.Io) u8 {
     return @intCast(index);
 }
 
+const AgentEventQueue = struct {
+    mutex: std.Io.Mutex = .init,
+    items: std.ArrayList(*agent_mod.Agent.StreamEvent) = .empty,
+
+    fn push(
+        self: *AgentEventQueue,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        event: *agent_mod.Agent.StreamEvent,
+    ) !void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        try self.items.append(gpa, event);
+    }
+
+    fn drainInto(
+        self: *AgentEventQueue,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        sink: *std.ArrayList(*agent_mod.Agent.StreamEvent),
+    ) !void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        try sink.appendSlice(gpa, self.items.items);
+        self.items.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *AgentEventQueue, io: std.Io, gpa: std.mem.Allocator) void {
+        self.mutex.lock(io) catch return;
+        defer self.mutex.unlock(io);
+        for (self.items.items) |event_ptr| {
+            event_ptr.deinit(gpa);
+            gpa.destroy(event_ptr);
+        }
+        self.items.deinit(gpa);
+    }
+};
+
 const AgentWorkerContext = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     agent: *agent_mod.Agent,
-    fw_app: ?*vxfw.App,
+    queue: AgentEventQueue = .{},
 };
 
 fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *AgentWorkerContext) void {
@@ -371,18 +411,12 @@ fn postAgentEvent(context: ?*anyopaque, event: agent_mod.Agent.StreamEvent) !voi
     const worker_context: *AgentWorkerContext = @ptrCast(@alignCast(context.?));
     var owned_event = event;
     errdefer owned_event.deinit(worker_context.gpa);
-    const fw_app = worker_context.fw_app orelse return error.AppNotRunning;
     const event_ptr = try worker_context.gpa.create(agent_mod.Agent.StreamEvent);
     errdefer worker_context.gpa.destroy(event_ptr);
     event_ptr.* = owned_event;
     owned_event = .delta_end;
     errdefer event_ptr.deinit(worker_context.gpa);
-    try fw_app.postEvent(.{
-        .app = .{
-            .name = "agent",
-            .data = event_ptr,
-        },
-    });
+    try worker_context.queue.push(worker_context.io, worker_context.gpa, event_ptr);
 }
 
 pub fn run(init: std.process.Init, agent: *agent_mod.Agent) !void {
@@ -391,17 +425,14 @@ pub fn run(init: std.process.Init, agent: *agent_mod.Agent) !void {
     var fw_app = try vxfw.App.init(init.io, gpa, init.environ_map, &tty_buffer);
     defer fw_app.deinit();
 
-    var app = App.init(init.io, gpa, agent, &fw_app);
+    var app = App.init(init.io, gpa, agent);
     defer app.deinit();
 
     const logo = try loadStartupLogo(init.io, gpa);
     defer gpa.free(logo);
     _ = try app.transcript.append(gpa, .logo, "logo", logo);
 
-    var root: RootWidget = .{
-        .app = &app,
-        .fw_app = &fw_app,
-    };
+    var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
 }
 
@@ -412,7 +443,7 @@ fn loadStartupLogo(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
 
 const RootWidget = struct {
     app: *App,
-    fw_app: *vxfw.App,
+    spinner_tick_accum: u32 = 0,
 
     fn widget(self: *RootWidget) vxfw.Widget {
         return .{
@@ -448,9 +479,6 @@ const RootWidget = struct {
                     ctx.consumeAndRedraw();
                 }
             },
-            .app => |app_event| {
-                try self.handleAppEvent(ctx, app_event);
-            },
             else => {},
         }
     }
@@ -458,26 +486,47 @@ const RootWidget = struct {
     fn handleEvent(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *RootWidget = @ptrCast(@alignCast(ptr));
         switch (event) {
-            .tick => try self.handleLoadingTick(ctx),
+            .tick => try self.handleTick(ctx),
             else => {},
         }
     }
 
-    fn handleLoadingTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+    const drain_tick_ms: u32 = 30;
+    const spinner_tick_threshold_ms: u32 = loading_frame_ms;
+
+    fn handleTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
+        var visible_change = try self.drainAgentEvents(ctx);
+
         if (self.app.loading_index) |_| {
-            self.app.advanceLoadingFrame();
-            try ctx.tick(loading_frame_ms, self.widget());
-            ctx.consumeAndRedraw();
-            return;
+            self.spinner_tick_accum += drain_tick_ms;
+            if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
+                self.spinner_tick_accum = 0;
+                self.app.advanceLoadingFrame();
+                visible_change = true;
+            }
+        } else {
+            self.spinner_tick_accum = 0;
         }
-        self.app.loading_tick_active = false;
-        ctx.consumeAndRedraw();
+
+        const should_tick = self.app.in_flight or self.app.loading_index != null;
+        if (should_tick) {
+            try ctx.tick(drain_tick_ms, self.widget());
+        } else {
+            self.app.loading_tick_active = false;
+        }
+
+        if (visible_change) {
+            ctx.consumeAndRedraw();
+        } else {
+            ctx.consumeEvent();
+        }
     }
 
     fn startLoadingTick(self: *RootWidget, ctx: *vxfw.EventContext) !void {
         if (self.app.loading_tick_active) return;
         self.app.loading_tick_active = true;
-        try ctx.tick(loading_frame_ms, self.widget());
+        self.spinner_tick_accum = 0;
+        try ctx.tick(drain_tick_ms, self.widget());
     }
 
     fn submit(self: *RootWidget, ctx: *vxfw.EventContext) !void {
@@ -488,21 +537,23 @@ const RootWidget = struct {
         ctx.consumeAndRedraw();
     }
 
-    fn handleAppEvent(self: *RootWidget, ctx: *vxfw.EventContext, app_event: vxfw.UserEvent) !void {
-        if (!std.mem.eql(u8, app_event.name, "agent")) return;
-        const data = app_event.data orelse return;
-        const event_ptr: *agent_mod.Agent.StreamEvent = @ptrCast(@alignCast(@constCast(data)));
-        defer self.app.agent.gpa.destroy(event_ptr);
-        defer event_ptr.deinit(self.app.agent.gpa);
+    fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
+        const worker_io = self.app.worker_context.io;
+        const worker_gpa = self.app.worker_context.gpa;
+        var batch: std.ArrayList(*agent_mod.Agent.StreamEvent) = .empty;
+        defer batch.deinit(worker_gpa);
+        try self.app.worker_context.queue.drainInto(worker_io, worker_gpa, &batch);
 
-        if (self.app.loading_index != null) try self.startLoadingTick(ctx);
-        if (try self.app.applyAgentEvent(event_ptr.*)) {
+        var visible_change = false;
+        for (batch.items) |event_ptr| {
+            defer worker_gpa.destroy(event_ptr);
+            defer event_ptr.deinit(worker_gpa);
+
             if (self.app.loading_index != null) try self.startLoadingTick(ctx);
-            ctx.consumeAndRedraw();
-        } else {
+            if (try self.app.applyAgentEvent(event_ptr.*)) visible_change = true;
             if (self.app.loading_index != null) try self.startLoadingTick(ctx);
-            ctx.consumeEvent();
         }
+        return visible_change;
     }
 
     fn drawRoot(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
