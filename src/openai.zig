@@ -1,6 +1,12 @@
 const std = @import("std");
 const ai = @import("ai.zig");
 
+const Scanner = std.json.Scanner;
+
+const redirect_buffer_bytes: u32 = 8192;
+const transfer_buffer_bytes: u32 = 4096;
+const body_buffer_bytes: u32 = 4096;
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -11,21 +17,15 @@ pub const Client = struct {
         messages: []const ai.ChatMessage,
         observer: ai.StreamObserver,
     ) !ai.Response {
+        std.debug.assert(self.config.base_url.len > 0);
+        std.debug.assert(self.config.model.len > 0);
+
         const url = try std.fmt.allocPrint(
             self.gpa,
             "{s}/v1/chat/completions",
             .{std.mem.trimEnd(u8, self.config.base_url, "/")},
         );
         defer self.gpa.free(url);
-
-        const payload = try self.requestPayload(messages, true);
-        defer self.gpa.free(payload);
-
-        var client: std.http.Client = .{
-            .allocator = self.gpa,
-            .io = self.io,
-        };
-        defer client.deinit();
 
         const authorization = try std.fmt.allocPrint(
             self.gpa,
@@ -34,7 +34,13 @@ pub const Client = struct {
         );
         defer self.gpa.free(authorization);
 
-        var req = try client.request(.POST, try std.Uri.parse(url), .{
+        var http_client: std.http.Client = .{
+            .allocator = self.gpa,
+            .io = self.io,
+        };
+        defer http_client.deinit();
+
+        var req = try http_client.request(.POST, try std.Uri.parse(url), .{
             .headers = .{
                 .authorization = .{ .override = authorization },
                 .content_type = .{ .override = "application/json" },
@@ -42,44 +48,46 @@ pub const Client = struct {
         });
         defer req.deinit();
 
-        try req.sendBodyComplete(payload);
-        var redirect_buffer: [8192]u8 = undefined;
-        var http_response = try req.receiveHead(&redirect_buffer);
-        if (@intFromEnum(http_response.head.status) < 200) return error.HttpStatus;
-        if (@intFromEnum(http_response.head.status) >= 300) return error.HttpStatus;
+        req.transfer_encoding = .chunked;
+        var body_buffer: [body_buffer_bytes]u8 = undefined;
+        var body_writer = try req.sendBodyUnflushed(&body_buffer);
+        try writeRequestPayload(&body_writer.writer, self.config.model, messages);
+        try body_writer.end();
+        try req.connection.?.flush();
 
-        var transfer_buffer: [4096]u8 = undefined;
+        var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
+        var http_response = try req.receiveHead(&redirect_buffer);
+        const status_code: u16 = @intFromEnum(http_response.head.status);
+        if (status_code < 200 or status_code >= 300) return error.HttpStatus;
+
+        var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
         return try readStream(self.gpa, reader, observer);
     }
-
-    fn requestPayload(self: *Client, messages: []const ai.ChatMessage, stream: bool) ![]u8 {
-        var writer: std.Io.Writer.Allocating = .init(self.gpa);
-        defer writer.deinit();
-        const out = &writer.writer;
-
-        try out.writeAll("{\"model\":");
-        try std.json.Stringify.value(self.config.model, .{}, out);
-        try out.writeAll(",\"messages\":[");
-        for (messages, 0..) |message, index| {
-            if (index > 0) try out.writeByte(',');
-            try out.writeAll("{\"role\":");
-            try std.json.Stringify.value(message.role, .{}, out);
-            try out.writeAll(",\"content\":");
-            try std.json.Stringify.value(message.content, .{}, out);
-            try out.writeByte('}');
-        }
-        if (stream) {
-            try out.writeAll("],\"stream\":true");
-        } else {
-            try out.writeByte(']');
-        }
-        try out.writeAll(
-            \\,"tools":[{"type":"function","function":{"name":"bash","description":"Run a bash command in the current project.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"tool_choice":"auto"}
-        );
-        return try writer.toOwnedSlice();
-    }
 };
+
+fn writeRequestPayload(
+    out: *std.Io.Writer,
+    model: []const u8,
+    messages: []const ai.ChatMessage,
+) !void {
+    std.debug.assert(model.len > 0);
+
+    try out.writeAll("{\"model\":");
+    try std.json.Stringify.value(model, .{}, out);
+    try out.writeAll(",\"messages\":[");
+    for (messages, 0..) |message, index| {
+        if (index > 0) try out.writeByte(',');
+        try out.writeAll("{\"role\":");
+        try std.json.Stringify.value(message.role, .{}, out);
+        try out.writeAll(",\"content\":");
+        try std.json.Stringify.value(message.content, .{}, out);
+        try out.writeByte('}');
+    }
+    try out.writeAll(
+        \\],"stream":true,"tools":[{"type":"function","function":{"name":"bash","description":"Run a bash command in the current project.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"tool_choice":"auto"}
+    );
+}
 
 const ToolCallBuilder = struct {
     id: std.ArrayList(u8) = .empty,
@@ -125,7 +133,7 @@ fn readStream(
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
         const data = std.mem.trim(u8, trimmed["data:".len..], " ");
         if (std.mem.eql(u8, data, "[DONE]")) break;
-        try parseStreamData(gpa, data, &content, &reasoning, &builders, observer);
+        try parseStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
     }
 
     var result: ai.Response = .{
@@ -141,7 +149,7 @@ fn readStream(
     return result;
 }
 
-fn parseStreamData(
+fn parseStreamChunk(
     gpa: std.mem.Allocator,
     data: []const u8,
     content: *std.ArrayList(u8),
@@ -149,136 +157,238 @@ fn parseStreamData(
     builders: *std.ArrayList(ToolCallBuilder),
     observer: ai.StreamObserver,
 ) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, data, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
+    std.debug.assert(data.len > 0);
 
-    const choices = parsed.value.object.get("choices") orelse return;
-    if (choices.array.items.len == 0) return;
-    const delta = choices.array.items[0].object.get("delta") orelse return;
+    var scanner = Scanner.initCompleteInput(gpa, data);
+    defer scanner.deinit();
 
     var changed = false;
-    if (jsonString(delta.object.get("content"))) |text| {
-        try content.appendSlice(gpa, text);
-        changed = true;
-        if (observer.on_content_delta) |callback| {
-            try callback(observer.context, text);
-        }
-    }
-    const reasoning_text = jsonString(delta.object.get("reasoning")) orelse
-        jsonString(delta.object.get("reasoning_content"));
-    if (reasoning_text) |text| {
-        try reasoning.appendSlice(gpa, text);
-        changed = true;
-        if (observer.on_reasoning_delta) |callback| {
-            try callback(observer.context, text);
+    try expectObjectBegin(&scanner);
+    while (try nextObjectKey(&scanner)) |key| {
+        if (std.mem.eql(u8, key, "choices")) {
+            try parseChoicesArray(gpa, &scanner, content, reasoning, builders, observer, &changed);
+        } else {
+            try scanner.skipValue();
         }
     }
 
-    if (delta.object.get("tool_calls")) |tool_calls| {
-        for (tool_calls.array.items) |item| {
-            if (try parseToolCallDelta(gpa, item, builders, observer)) {
-                changed = true;
-            }
-        }
-    }
+    if (!changed) return;
+    if (observer.on_delta_end) |callback| try callback(observer.context);
+}
 
-    if (changed) {
-        if (observer.on_delta_end) |callback| {
-            try callback(observer.context);
+fn parseChoicesArray(
+    gpa: std.mem.Allocator,
+    scanner: *Scanner,
+    content: *std.ArrayList(u8),
+    reasoning: *std.ArrayList(u8),
+    builders: *std.ArrayList(ToolCallBuilder),
+    observer: ai.StreamObserver,
+    changed: *bool,
+) !void {
+    try expectArrayBegin(scanner);
+    var saw_first = false;
+    while (true) {
+        const peeked = try scanner.peekNextTokenType();
+        if (peeked == .array_end) {
+            _ = try scanner.next();
+            return;
+        }
+        if (saw_first) {
+            try scanner.skipValue();
+            continue;
+        }
+        try expectObjectBegin(scanner);
+        try parseChoiceObject(gpa, scanner, content, reasoning, builders, observer, changed);
+        saw_first = true;
+    }
+}
+
+fn parseChoiceObject(
+    gpa: std.mem.Allocator,
+    scanner: *Scanner,
+    content: *std.ArrayList(u8),
+    reasoning: *std.ArrayList(u8),
+    builders: *std.ArrayList(ToolCallBuilder),
+    observer: ai.StreamObserver,
+    changed: *bool,
+) !void {
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, "delta")) {
+            try parseDeltaObject(gpa, scanner, content, reasoning, builders, observer, changed);
+        } else {
+            try scanner.skipValue();
         }
     }
 }
 
-fn parseToolCallDelta(
+fn parseDeltaObject(
     gpa: std.mem.Allocator,
-    item: std.json.Value,
+    scanner: *Scanner,
+    content: *std.ArrayList(u8),
+    reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
     observer: ai.StreamObserver,
-) !bool {
-    const index_value = item.object.get("index") orelse return false;
-    if (index_value != .integer) return false;
-    const index: usize = @intCast(index_value.integer);
-    while (builders.items.len <= index) {
-        try builders.append(gpa, .{});
+    changed: *bool,
+) !void {
+    try expectObjectBegin(scanner);
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, "content")) {
+            const before = content.items.len;
+            try appendStringValue(scanner, gpa, content);
+            changed.* = true;
+            if (observer.on_content_delta) |callback| {
+                try callback(observer.context, content.items[before..]);
+            }
+        } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
+            const before = reasoning.items.len;
+            try appendStringValue(scanner, gpa, reasoning);
+            changed.* = true;
+            if (observer.on_reasoning_delta) |callback| {
+                try callback(observer.context, reasoning.items[before..]);
+            }
+        } else if (std.mem.eql(u8, key, "tool_calls")) {
+            try parseToolCallsArray(gpa, scanner, builders, observer, changed);
+        } else {
+            try scanner.skipValue();
+        }
+    }
+}
+
+fn parseToolCallsArray(
+    gpa: std.mem.Allocator,
+    scanner: *Scanner,
+    builders: *std.ArrayList(ToolCallBuilder),
+    observer: ai.StreamObserver,
+    changed: *bool,
+) !void {
+    try expectArrayBegin(scanner);
+    while (true) {
+        const peeked = try scanner.peekNextTokenType();
+        if (peeked == .array_end) {
+            _ = try scanner.next();
+            return;
+        }
+        try expectObjectBegin(scanner);
+        try parseToolCallObject(gpa, scanner, builders, observer, changed);
+    }
+}
+
+fn parseToolCallObject(
+    gpa: std.mem.Allocator,
+    scanner: *Scanner,
+    builders: *std.ArrayList(ToolCallBuilder),
+    observer: ai.StreamObserver,
+    changed: *bool,
+) !void {
+    var pending: ToolCallBuilder = .{};
+    defer pending.deinit(gpa);
+    var has_pending_id = false;
+    var has_pending_name = false;
+    var has_pending_arguments = false;
+    var resolved_index: ?usize = null;
+
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, "index")) {
+            const index = try nextInteger(scanner);
+            if (index < 0) return error.InvalidToolCallIndex;
+            resolved_index = @intCast(index);
+        } else if (std.mem.eql(u8, key, "id")) {
+            try appendStringValue(scanner, gpa, &pending.id);
+            has_pending_id = true;
+        } else if (std.mem.eql(u8, key, "function")) {
+            try parseToolCallFunction(gpa, scanner, &pending, &has_pending_name, &has_pending_arguments);
+        } else {
+            try scanner.skipValue();
+        }
     }
 
-    const builder = &builders.items[index];
-    var changed = false;
-    if (jsonString(item.object.get("id"))) |id| {
-        try builder.id.appendSlice(gpa, id);
-        changed = true;
+    const idx = resolved_index orelse return;
+    while (builders.items.len <= idx) try builders.append(gpa, .{});
+    const target = &builders.items[idx];
+
+    if (has_pending_id) {
+        try target.id.appendSlice(gpa, pending.id.items);
+        changed.* = true;
     }
-    const function = item.object.get("function") orelse return changed;
-    if (jsonString(function.object.get("name"))) |name| {
-        try builder.name.appendSlice(gpa, name);
-        changed = true;
+    if (has_pending_name) {
+        try target.name.appendSlice(gpa, pending.name.items);
+        changed.* = true;
     }
-    if (jsonString(function.object.get("arguments"))) |arguments| {
-        try builder.arguments.appendSlice(gpa, arguments);
-        changed = true;
+    if (has_pending_arguments) {
+        try target.arguments.appendSlice(gpa, pending.arguments.items);
+        changed.* = true;
     }
 
     if (observer.on_tool_delta) |callback| {
-        try callback(observer.context, index, builder.name.items, builder.arguments.items);
+        try callback(observer.context, idx, target.name.items, target.arguments.items);
     }
-    return changed;
 }
 
-pub fn parseResponse(gpa: std.mem.Allocator, body: []const u8) !ai.Response {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-
-    const choices = parsed.value.object.get("choices") orelse return error.InvalidResponse;
-    if (choices.array.items.len == 0) return error.InvalidResponse;
-    const message = choices.array.items[0].object.get("message") orelse return error.InvalidResponse;
-    const reasoning = jsonString(message.object.get("reasoning")) orelse
-        jsonString(message.object.get("reasoning_content")) orelse "";
-
-    var response: ai.Response = .{
-        .content = try gpa.dupe(u8, jsonString(message.object.get("content")) orelse ""),
-        .reasoning = try gpa.dupe(u8, reasoning),
-    };
-    errdefer response.deinit(gpa);
-
-    if (message.object.get("tool_calls")) |tool_calls| {
-        for (tool_calls.array.items) |item| {
-            const call = item.object;
-            const function = call.get("function") orelse continue;
-            try response.tool_calls.append(gpa, .{
-                .index = response.tool_calls.items.len,
-                .id = try gpa.dupe(u8, jsonString(call.get("id")) orelse ""),
-                .name = try gpa.dupe(u8, jsonString(function.object.get("name")) orelse ""),
-                .arguments = try gpa.dupe(u8, jsonString(function.object.get("arguments")) orelse "{}"),
-            });
+fn parseToolCallFunction(
+    gpa: std.mem.Allocator,
+    scanner: *Scanner,
+    pending: *ToolCallBuilder,
+    has_pending_name: *bool,
+    has_pending_arguments: *bool,
+) !void {
+    try expectObjectBegin(scanner);
+    while (try nextObjectKey(scanner)) |key| {
+        if (std.mem.eql(u8, key, "name")) {
+            try appendStringValue(scanner, gpa, &pending.name);
+            has_pending_name.* = true;
+        } else if (std.mem.eql(u8, key, "arguments")) {
+            try appendStringValue(scanner, gpa, &pending.arguments);
+            has_pending_arguments.* = true;
+        } else {
+            try scanner.skipValue();
         }
     }
-
-    return response;
 }
 
-fn jsonString(value: ?std.json.Value) ?[]const u8 {
-    const concrete = value orelse return null;
-    return switch (concrete) {
-        .string => |string| string,
-        .null => null,
-        else => null,
+fn expectObjectBegin(scanner: *Scanner) !void {
+    const token = try scanner.next();
+    if (token != .object_begin) return error.UnexpectedToken;
+}
+
+fn expectArrayBegin(scanner: *Scanner) !void {
+    const token = try scanner.next();
+    if (token != .array_begin) return error.UnexpectedToken;
+}
+
+fn nextObjectKey(scanner: *Scanner) !?[]const u8 {
+    const token = try scanner.next();
+    return switch (token) {
+        .object_end => null,
+        .string => |s| s,
+        else => error.UnexpectedToken,
     };
 }
 
-test "parse response content and tool calls" {
-    const gpa = std.testing.allocator;
-    var response = try parseResponse(gpa,
-        \\{"choices":[{"message":{"content":"done","tool_calls":[{"id":"1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}
-    );
-    defer response.deinit(gpa);
+fn nextInteger(scanner: *Scanner) !i64 {
+    const token = try scanner.next();
+    const text = switch (token) {
+        .number => |s| s,
+        else => return error.UnexpectedToken,
+    };
+    return try std.fmt.parseInt(i64, text, 10);
+}
 
-    try std.testing.expectEqualStrings("done", response.content);
-    try std.testing.expectEqual(@as(usize, 1), response.tool_calls.items.len);
-    try std.testing.expectEqualStrings("bash", response.tool_calls.items[0].name);
+fn appendStringValue(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    while (true) {
+        const token = try scanner.next();
+        switch (token) {
+            .string => |s| {
+                try list.appendSlice(gpa, s);
+                return;
+            },
+            .partial_string => |s| try list.appendSlice(gpa, s),
+            .partial_string_escaped_1 => |bytes| try list.appendSlice(gpa, &bytes),
+            .partial_string_escaped_2 => |bytes| try list.appendSlice(gpa, &bytes),
+            .partial_string_escaped_3 => |bytes| try list.appendSlice(gpa, &bytes),
+            .partial_string_escaped_4 => |bytes| try list.appendSlice(gpa, &bytes),
+            else => return error.UnexpectedToken,
+        }
+    }
 }
 
 test "parse streaming tool deltas as they arrive" {
@@ -309,13 +419,13 @@ test "parse streaming tool deltas as they arrive" {
     };
     var seen: Seen = .{};
 
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
         .on_tool_delta = Seen.onToolDelta,
     });
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" build\"}"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -325,6 +435,30 @@ test "parse streaming tool deltas as they arrive" {
     try std.testing.expectEqualStrings("bash", seen.name);
     try std.testing.expectEqualStrings("{\"command\":\"zig build\"}", seen.arguments);
     try std.testing.expectEqual(@as(usize, 0), seen.index);
+}
+
+test "parse streaming tool deltas tolerate key reorder" {
+    const gpa = std.testing.allocator;
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
+    var builders: std.ArrayList(ToolCallBuilder) = .empty;
+    defer {
+        for (builders.items) |*builder| {
+            builder.deinit(gpa);
+        }
+        builders.deinit(gpa);
+    }
+
+    try parseStreamChunk(gpa,
+        \\{"choices":[{"delta":{"tool_calls":[{"function":{"name":"bash","arguments":"{}"},"id":"call_1","index":0}]}}]}
+    , &content, &reasoning, &builders, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), builders.items.len);
+    try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
+    try std.testing.expectEqualStrings("bash", builders.items[0].name.items);
+    try std.testing.expectEqualStrings("{}", builders.items[0].arguments.items);
 }
 
 test "parse streaming tool deltas batches render notification per event" {
@@ -357,7 +491,7 @@ test "parse streaming tool deltas batches render notification per event" {
     };
     var seen: Seen = .{};
 
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -399,7 +533,7 @@ test "parse streaming reasoning deltas as they arrive" {
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
 
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -440,13 +574,13 @@ test "parse streaming content deltas as they arrive" {
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
 
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
         .on_content_delta = Seen.onContentDelta,
     });
-    try parseStreamData(gpa,
+    try parseStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"lo"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
