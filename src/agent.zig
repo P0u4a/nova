@@ -41,13 +41,13 @@ pub const Agent = struct {
         turn_failed: []const u8,
 
         pub const ToolDelta = struct {
-            index: usize,
+            index: u32,
             name: []const u8,
             arguments: []const u8,
         };
 
         pub const ToolFinished = struct {
-            index: usize,
+            index: u32,
             command: []const u8,
             body: []const u8,
         };
@@ -120,7 +120,7 @@ pub const Agent = struct {
 
     fn runBashTool(
         self: *Agent,
-        tool_index: usize,
+        tool_index: u32,
         name: []const u8,
         arguments: []const u8,
         streamed_preview: bool,
@@ -157,12 +157,12 @@ pub const Agent = struct {
             self.tool_delta_seen.deinit(self.agent.gpa);
         }
 
-        fn toolDeltaSeen(self: *const StreamContext, tool_index: usize) bool {
+        fn toolDeltaSeen(self: *const StreamContext, tool_index: u32) bool {
             if (tool_index >= self.tool_delta_seen.items.len) return false;
             return self.tool_delta_seen.items[tool_index];
         }
 
-        fn markToolDeltaSeen(self: *StreamContext, tool_index: usize) !void {
+        fn markToolDeltaSeen(self: *StreamContext, tool_index: u32) !void {
             while (self.tool_delta_seen.items.len <= tool_index) {
                 try self.tool_delta_seen.append(self.agent.gpa, false);
             }
@@ -184,7 +184,7 @@ pub const Agent = struct {
         try postEvent(concrete.events, .{ .reasoning_delta = owned });
     }
 
-    fn onToolDelta(context: ?*anyopaque, tool_index: usize, name: []const u8, arguments: []const u8) !void {
+    fn onToolDelta(context: ?*anyopaque, tool_index: u32, name: []const u8, arguments: []const u8) !void {
         const concrete: *StreamContext = @ptrCast(@alignCast(context.?));
         if (!std.mem.eql(u8, name, "bash")) return;
         try concrete.markToolDeltaSeen(tool_index);
@@ -199,7 +199,7 @@ pub const Agent = struct {
     fn postToolDelta(
         self: *Agent,
         events: Events,
-        tool_index: usize,
+        tool_index: u32,
         name: []const u8,
         arguments: []const u8,
     ) !void {
@@ -219,7 +219,7 @@ pub const Agent = struct {
     fn postToolFinished(
         self: *Agent,
         events: Events,
-        tool_index: usize,
+        tool_index: u32,
         command: []const u8,
         body: []const u8,
     ) !void {
@@ -273,11 +273,9 @@ test "parse bash command arguments" {
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
     const openai = @import("openai.zig");
-    var openai_client: openai.Client = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
-    };
+    var openai_client: openai.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
     var agent = Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
@@ -315,7 +313,7 @@ test "streaming callbacks emit owned events" {
     try std.testing.expectEqual(@as(usize, 4), seen.events.items.len);
     try std.testing.expectEqualStrings("checking", seen.events.items[0].reasoning_delta);
     try std.testing.expectEqualStrings("hello", seen.events.items[1].content_delta);
-    try std.testing.expectEqual(@as(usize, 1), seen.events.items[2].tool_delta.index);
+    try std.testing.expectEqual(@as(u32, 1), seen.events.items[2].tool_delta.index);
     try std.testing.expectEqualStrings("bash", seen.events.items[2].tool_delta.name);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", seen.events.items[2].tool_delta.arguments);
     try std.testing.expectEqual(.delta_end, seen.events.items[3]);
