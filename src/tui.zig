@@ -9,7 +9,7 @@ const transcript_mod = @import("transcript.zig");
 const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
 const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
-const loading_frame_ms = 83;
+const loading_frame_ms = 40;
 
 pub const App = struct {
     io: std.Io,
@@ -208,7 +208,6 @@ pub const App = struct {
         }
         if (!self.tool_seen_in_response) {
             self.selectGeneratedMessage(self.agent_index.?);
-            self.transcript_auto_scroll = true;
         }
     }
 
@@ -1208,6 +1207,28 @@ test "user can navigate away from a streaming agent message" {
 
     _ = try app.applyAgentEvent(.{ .content_delta = " more" });
     try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+}
+
+test "content deltas do not override user scroll state" {
+    const gpa = std.testing.allocator;
+    var openai_client: openai_mod.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("hello");
+    _ = (try app.beginSubmit()).?;
+
+    _ = try app.applyAgentEvent(.{ .content_delta = "first" });
+    try std.testing.expect(app.transcript_auto_scroll);
+
+    app.transcript_auto_scroll = false;
+    _ = try app.applyAgentEvent(.{ .content_delta = " second" });
+    try std.testing.expect(!app.transcript_auto_scroll);
 }
 
 test "tool row persists through finish and turn completion" {
