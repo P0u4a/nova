@@ -28,11 +28,11 @@ pub const Message = struct {
     }
 };
 
-pub const Transcript = struct {
+pub const Thread = struct {
     messages: std.ArrayList(Message) = .empty,
     selected: ?u32 = null,
 
-    pub fn deinit(self: *Transcript, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
         for (self.messages.items) |*message| {
             message.deinit(gpa);
         }
@@ -41,7 +41,7 @@ pub const Transcript = struct {
     }
 
     pub fn append(
-        self: *Transcript,
+        self: *Thread,
         gpa: std.mem.Allocator,
         kind: MessageKind,
         title: []const u8,
@@ -65,7 +65,7 @@ pub const Transcript = struct {
     }
 
     pub fn appendAgentDelta(
-        self: *Transcript,
+        self: *Thread,
         gpa: std.mem.Allocator,
         index: u32,
         delta: []const u8,
@@ -77,7 +77,7 @@ pub const Transcript = struct {
     }
 
     pub fn appendThinkingDelta(
-        self: *Transcript,
+        self: *Thread,
         gpa: std.mem.Allocator,
         index: u32,
         delta: []const u8,
@@ -89,7 +89,7 @@ pub const Transcript = struct {
     }
 
     pub fn insert(
-        self: *Transcript,
+        self: *Thread,
         gpa: std.mem.Allocator,
         index: u32,
         kind: MessageKind,
@@ -115,13 +115,13 @@ pub const Transcript = struct {
         return index;
     }
 
-    pub fn select(self: *Transcript, index: u32) void {
+    pub fn select(self: *Thread, index: u32) void {
         assert(index < self.messages.items.len);
         assert(self.messages.items[index].kind.selectable());
         self.selected = index;
     }
 
-    pub fn remove(self: *Transcript, gpa: std.mem.Allocator, index: u32) void {
+    pub fn remove(self: *Thread, gpa: std.mem.Allocator, index: u32) void {
         assert(index < self.messages.items.len);
         self.messages.items[index].deinit(gpa);
         _ = self.messages.orderedRemove(index);
@@ -141,7 +141,7 @@ pub const Transcript = struct {
         }
     }
 
-    pub fn startTool(self: *Transcript, gpa: std.mem.Allocator, command: []const u8) !u32 {
+    pub fn startTool(self: *Thread, gpa: std.mem.Allocator, command: []const u8) !u32 {
         const title = try toolTitle(gpa, command);
         defer gpa.free(title);
         const index = try self.append(gpa, .tool, title, "");
@@ -149,7 +149,7 @@ pub const Transcript = struct {
         return index;
     }
 
-    pub fn updateTool(self: *Transcript, gpa: std.mem.Allocator, index: u32, command: []const u8) !void {
+    pub fn updateTool(self: *Thread, gpa: std.mem.Allocator, index: u32, command: []const u8) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
@@ -159,7 +159,7 @@ pub const Transcript = struct {
         message.title = title;
     }
 
-    pub fn finishThinking(self: *Transcript, gpa: std.mem.Allocator, index: u32) !void {
+    pub fn finishThinking(self: *Thread, gpa: std.mem.Allocator, index: u32) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .thinking);
@@ -170,14 +170,14 @@ pub const Transcript = struct {
         message.title = title;
     }
 
-    pub fn finishTool(self: *Transcript, gpa: std.mem.Allocator, index: u32, body: []const u8) !void {
+    pub fn finishTool(self: *Thread, gpa: std.mem.Allocator, index: u32, body: []const u8) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
         try appendOwned(gpa, &message.body, body);
     }
 
-    pub fn moveSelection(self: *Transcript, direction: enum { previous, next }) void {
+    pub fn moveSelection(self: *Thread, direction: enum { previous, next }) void {
         if (self.messages.items.len == 0) {
             self.selected = null;
             return;
@@ -190,7 +190,7 @@ pub const Transcript = struct {
         };
     }
 
-    pub fn toggleSelected(self: *Transcript) void {
+    pub fn toggleSelected(self: *Thread) void {
         const selected = self.selected orelse return;
         assert(selected < self.messages.items.len);
         const message = &self.messages.items[selected];
@@ -200,7 +200,7 @@ pub const Transcript = struct {
         }
     }
 
-    fn nearestSelectable(self: *const Transcript, index: u32) ?u32 {
+    fn nearestSelectable(self: *const Thread, index: u32) ?u32 {
         assert(self.messages.items.len > 0);
         assert(index < self.messages.items.len);
         if (self.messages.items[index].kind.selectable()) return index;
@@ -208,7 +208,7 @@ pub const Transcript = struct {
         return self.previousSelectable(index);
     }
 
-    fn previousSelectable(self: *const Transcript, index: u32) ?u32 {
+    fn previousSelectable(self: *const Thread, index: u32) ?u32 {
         assert(index < self.messages.items.len);
         var current = index;
         while (current > 0) {
@@ -218,7 +218,7 @@ pub const Transcript = struct {
         return null;
     }
 
-    fn nextSelectable(self: *const Transcript, index: u32) ?u32 {
+    fn nextSelectable(self: *const Thread, index: u32) ?u32 {
         assert(index < self.messages.items.len);
         var current = index + 1;
         while (current < self.messages.items.len) : (current += 1) {
@@ -244,40 +244,40 @@ fn toolTitle(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
 
 test "thinking and tool messages are compact until toggled" {
     const gpa = std.testing.allocator;
-    var transcript: Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
 
-    _ = try transcript.append(gpa, .thinking, "thinking", "one two three four");
-    try std.testing.expect(!transcript.messages.items[0].expanded);
-    transcript.toggleSelected();
-    try std.testing.expect(transcript.messages.items[0].expanded);
+    _ = try thread.append(gpa, .thinking, "thinking", "one two three four");
+    try std.testing.expect(!thread.messages.items[0].expanded);
+    thread.toggleSelected();
+    try std.testing.expect(thread.messages.items[0].expanded);
 }
 
 test "consecutive tools remain separate messages" {
     const gpa = std.testing.allocator;
-    var transcript: Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
 
-    const first = try transcript.startTool(gpa, "ls");
-    try transcript.finishTool(gpa, first, "ls\n");
-    const second = try transcript.startTool(gpa, "pwd");
+    const first = try thread.startTool(gpa, "ls");
+    try thread.finishTool(gpa, first, "ls\n");
+    const second = try thread.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
-    try std.testing.expectEqual(@as(usize, 2), transcript.messages.items.len);
-    try std.testing.expectEqualStrings("$ ls", transcript.messages.items[0].title);
-    try std.testing.expectEqualStrings("$ pwd", transcript.messages.items[1].title);
-    try std.testing.expect(!transcript.messages.items[0].expanded);
-    try std.testing.expect(!transcript.messages.items[1].expanded);
+    try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);
+    try std.testing.expectEqualStrings("$ ls", thread.messages.items[0].title);
+    try std.testing.expectEqualStrings("$ pwd", thread.messages.items[1].title);
+    try std.testing.expect(!thread.messages.items[0].expanded);
+    try std.testing.expect(!thread.messages.items[1].expanded);
 }
 
 test "remove keeps selection in range" {
     const gpa = std.testing.allocator;
-    var transcript: Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: Thread = .{};
+    defer thread.deinit(gpa);
 
-    _ = try transcript.append(gpa, .user, "you", "one");
-    _ = try transcript.append(gpa, .agent, "agent", "two");
-    transcript.remove(gpa, 1);
+    _ = try thread.append(gpa, .user, "you", "one");
+    _ = try thread.append(gpa, .agent, "agent", "two");
+    thread.remove(gpa, 1);
 
-    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
-    try std.testing.expectEqual(@as(u32, 0), transcript.selected.?);
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expectEqual(@as(u32, 0), thread.selected.?);
 }

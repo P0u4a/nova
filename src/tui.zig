@@ -4,7 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
 const openai_mod = @import("ai/openai.zig");
-const transcript_mod = @import("transcript.zig");
+const thread_mod = @import("thread.zig");
 
 const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
@@ -15,7 +15,7 @@ pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     agent: *agent_mod.Agent,
-    transcript: transcript_mod.Transcript = .{},
+    thread: thread_mod.Thread = .{},
     input: vxfw.TextField,
     worker_context: AgentWorkerContext,
     turn_future: ?std.Io.Future(void) = null,
@@ -28,9 +28,9 @@ pub const App = struct {
     thinking_index: ?u32 = null,
     tool_seen_in_response: bool = false,
     pending_redraw: bool = false,
-    transcript_auto_scroll: bool = true,
+    thread_auto_scroll: bool = true,
     tool_indexes: std.ArrayList(?u32) = .empty,
-    transcript_list: vxfw.ListView = .{
+    thread_list: vxfw.ListView = .{
         .children = .{ .slice = &.{} },
         .draw_cursor = false,
         .wheel_scroll = 4,
@@ -54,7 +54,7 @@ pub const App = struct {
         self.awaitTurn();
         self.worker_context.queue.deinit(self.worker_context.io, self.worker_context.gpa);
         self.tool_indexes.deinit(self.gpa);
-        self.transcript.deinit(self.gpa);
+        self.thread.deinit(self.gpa);
         self.input.deinit();
         self.* = undefined;
     }
@@ -73,7 +73,7 @@ pub const App = struct {
         if (prompt.len == 0) return null;
 
         self.resetTurnState();
-        _ = try self.transcript.append(self.gpa, .user, "you", prompt);
+        _ = try self.thread.append(self.gpa, .user, "you", prompt);
         try self.agent.addUser(prompt);
         try self.appendLoading();
         self.in_flight = true;
@@ -88,7 +88,7 @@ pub const App = struct {
         self.loading_word_index = chooseLoadingWordIndex(self.io);
         self.tool_seen_in_response = false;
         self.pending_redraw = false;
-        self.transcript_auto_scroll = true;
+        self.thread_auto_scroll = true;
         self.tool_indexes.clearRetainingCapacity();
     }
 
@@ -102,7 +102,7 @@ pub const App = struct {
     fn appendLoading(self: *App) !void {
         std.debug.assert(self.loading_index == null);
         std.debug.assert(self.loading_word_index < loading_spinners.len);
-        self.loading_index = try self.transcript.append(
+        self.loading_index = try self.thread.append(
             self.gpa,
             .status,
             loading_spinners[self.loading_word_index],
@@ -113,8 +113,8 @@ pub const App = struct {
     fn removeLoading(self: *App) void {
         const index = self.loading_index orelse return;
         self.loading_index = null;
-        if (index < self.transcript.messages.items.len) {
-            self.transcript.remove(self.gpa, index);
+        if (index < self.thread.messages.items.len) {
+            self.thread.remove(self.gpa, index);
         }
     }
 
@@ -178,7 +178,7 @@ pub const App = struct {
             },
             .turn_failed => |message| {
                 self.removeLoading();
-                _ = try self.transcript.append(self.gpa, .agent, "agent", message);
+                _ = try self.thread.append(self.gpa, .agent, "agent", message);
                 return true;
             },
             .turn_finished => {
@@ -203,9 +203,9 @@ pub const App = struct {
     fn applyContentDelta(self: *App, delta: []const u8) !void {
         if (delta.len == 0) return;
         if (self.agent_index) |index| {
-            try self.transcript.appendAgentDelta(self.gpa, index, delta);
+            try self.thread.appendAgentDelta(self.gpa, index, delta);
         } else {
-            self.agent_index = try self.transcript.append(self.gpa, .agent, "agent", delta);
+            self.agent_index = try self.thread.append(self.gpa, .agent, "agent", delta);
         }
         if (!self.tool_seen_in_response) {
             self.selectGeneratedMessage(self.agent_index.?);
@@ -214,9 +214,9 @@ pub const App = struct {
 
     fn finishThinking(self: *App) !bool {
         const index = self.thinking_index orelse return false;
-        if (index >= self.transcript.messages.items.len) return false;
-        if (std.mem.eql(u8, self.transcript.messages.items[index].title, "Thoughts")) return false;
-        try self.transcript.finishThinking(self.gpa, index);
+        if (index >= self.thread.messages.items.len) return false;
+        if (std.mem.eql(u8, self.thread.messages.items[index].title, "Thoughts")) return false;
+        try self.thread.finishThinking(self.gpa, index);
         return true;
     }
 
@@ -224,9 +224,9 @@ pub const App = struct {
         if (delta.len == 0) return false;
         var visible_change = false;
         if (self.thinking_index) |index| {
-            try self.transcript.appendThinkingDelta(self.gpa, index, delta);
+            try self.thread.appendThinkingDelta(self.gpa, index, delta);
         } else if (self.agent_index) |agent_index| {
-            self.thinking_index = try self.transcript.insert(
+            self.thinking_index = try self.thread.insert(
                 self.gpa,
                 agent_index,
                 .thinking,
@@ -234,10 +234,10 @@ pub const App = struct {
                 delta,
             );
             self.agent_index = agent_index + 1;
-            self.transcript.select(self.thinking_index.?);
+            self.thread.select(self.thinking_index.?);
             visible_change = true;
         } else {
-            self.thinking_index = try self.transcript.append(self.gpa, .thinking, "Thinking...", delta);
+            self.thinking_index = try self.thread.append(self.gpa, .thinking, "Thinking...", delta);
             visible_change = true;
         }
         if (self.agent_index == null and !self.tool_seen_in_response) {
@@ -253,12 +253,12 @@ pub const App = struct {
 
         self.removeLoading();
         var visible_change = false;
-        if (self.toolTranscriptIndex(tool.index)) |index| {
-            visible_change = !toolTitleMatchesCommand(self.transcript.messages.items[index].title, command);
-            try self.transcript.updateTool(self.gpa, index, command);
+        if (self.toolThreadIndex(tool.index)) |index| {
+            visible_change = !toolTitleMatchesCommand(self.thread.messages.items[index].title, command);
+            try self.thread.updateTool(self.gpa, index, command);
         } else {
-            const index = try self.transcript.startTool(self.gpa, command);
-            try self.putToolTranscriptIndex(tool.index, index);
+            const index = try self.thread.startTool(self.gpa, command);
+            try self.putToolThreadIndex(tool.index, index);
             visible_change = true;
         }
         self.tool_seen_in_response = true;
@@ -266,70 +266,70 @@ pub const App = struct {
     }
 
     fn applyToolFinished(self: *App, tool: agent_mod.Agent.StreamEvent.ToolFinished) !bool {
-        const existing_index = self.toolTranscriptIndex(tool.index);
+        const existing_index = self.toolThreadIndex(tool.index);
         const index = if (existing_index) |index| index else index: {
-            const created = try self.transcript.startTool(self.gpa, tool.command);
-            try self.putToolTranscriptIndex(tool.index, created);
+            const created = try self.thread.startTool(self.gpa, tool.command);
+            try self.putToolThreadIndex(tool.index, created);
             break :index created;
         };
 
         const visible_before = self.toolFinishVisibleChange(index, tool.command);
-        try self.transcript.updateTool(self.gpa, index, tool.command);
-        try self.transcript.finishTool(self.gpa, index, tool.body);
+        try self.thread.updateTool(self.gpa, index, tool.command);
+        try self.thread.finishTool(self.gpa, index, tool.body);
         self.selectGeneratedMessage(index);
         self.tool_seen_in_response = true;
         return existing_index == null or visible_before;
     }
 
     fn selectGeneratedMessage(self: *App, index: u32) void {
-        if (self.transcript.selected) |selected| {
+        if (self.thread.selected) |selected| {
             if (selected != index) return;
         }
-        self.transcript.select(index);
+        self.thread.select(index);
     }
 
     fn toolFinishVisibleChange(self: *const App, index: u32, command: []const u8) bool {
-        if (index >= self.transcript.messages.items.len) return true;
-        const message = self.transcript.messages.items[index];
+        if (index >= self.thread.messages.items.len) return true;
+        const message = self.thread.messages.items[index];
         if (message.kind != .tool) return true;
         if (message.expanded) return true;
         return !toolTitleMatchesCommand(message.title, command);
     }
 
-    fn toolTranscriptIndex(self: *const App, tool_index: u32) ?u32 {
+    fn toolThreadIndex(self: *const App, tool_index: u32) ?u32 {
         if (tool_index >= self.tool_indexes.items.len) return null;
         return self.tool_indexes.items[tool_index];
     }
 
-    fn putToolTranscriptIndex(self: *App, tool_index: u32, transcript_index: u32) !void {
+    fn putToolThreadIndex(self: *App, tool_index: u32, thread_index: u32) !void {
         while (self.tool_indexes.items.len <= tool_index) {
             try self.tool_indexes.append(self.gpa, null);
         }
-        self.tool_indexes.items[tool_index] = transcript_index;
+        self.tool_indexes.items[tool_index] = thread_index;
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.up, .{})) {
-            self.transcript.moveSelection(.previous);
-            self.transcript_auto_scroll = false;
+            self.thread.moveSelection(.previous);
+            self.thread_auto_scroll = false;
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            self.transcript.moveSelection(.next);
-            self.transcript_auto_scroll = self.selectionIsLastMessage();
+            self.thread.moveSelection(.next);
+            self.thread_auto_scroll = self.selectionIsLastMessage();
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            self.transcript.toggleSelected();
+            self.thread.toggleSelected();
             return true;
         }
         return false;
     }
 
     fn selectionIsLastMessage(self: *const App) bool {
-        const selected = self.transcript.selected orelse return false;
-        if (self.transcript.messages.items.len == 0) return false;
-        return selected == self.transcript.messages.items.len - 1;
+        const selected = self.thread.selected orelse return false;
+        if (self.thread.messages.items.len == 0) return false;
+        return selected == self.thread.messages.items.len - 1;
     }
 };
 
@@ -432,7 +432,7 @@ pub fn run(init: std.process.Init, agent: *agent_mod.Agent) !void {
 
     const logo = try loadStartupLogo(init.io, gpa);
     defer gpa.free(logo);
-    _ = try app.transcript.append(gpa, .logo, "logo", logo);
+    _ = try app.thread.append(gpa, .logo, "logo", logo);
 
     var root: RootWidget = .{ .app = &app };
     try fw_app.run(root.widget(), .{});
@@ -464,8 +464,8 @@ const RootWidget = struct {
                 ctx.consumeAndRedraw();
             },
             .mouse => |mouse| {
-                if (mouse.button == .wheel_up) self.app.transcript_auto_scroll = false;
-                if (mouse.button == .wheel_down) self.app.transcript_auto_scroll = !self.app.transcript_list.scroll.has_more;
+                if (mouse.button == .wheel_up) self.app.thread_auto_scroll = false;
+                if (mouse.button == .wheel_down) self.app.thread_auto_scroll = !self.app.thread_list.scroll.has_more;
             },
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
@@ -563,14 +563,14 @@ const RootWidget = struct {
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const input_height: u16 = @min(max_height, 3);
-        const transcript_height: u16 = max_height - input_height;
+        const thread_height: u16 = max_height - input_height;
 
-        var transcript_view: TranscriptWidget = .{ .app = self.app };
+        var thread_view: ThreadWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
 
-        const transcript_ctx = ctx.withConstraints(
-            .{ .width = max_width, .height = transcript_height },
-            .{ .width = max_width, .height = transcript_height },
+        const thread_ctx = ctx.withConstraints(
+            .{ .width = max_width, .height = thread_height },
+            .{ .width = max_width, .height = thread_height },
         );
         const input_ctx = ctx.withConstraints(
             .{ .width = max_width, .height = input_height },
@@ -580,11 +580,11 @@ const RootWidget = struct {
         const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
         children[0] = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try transcript_view.widget().draw(transcript_ctx),
+            .surface = try thread_view.widget().draw(thread_ctx),
             .z_index = 0,
         };
         children[1] = .{
-            .origin = .{ .row = transcript_height, .col = 0 },
+            .origin = .{ .row = thread_height, .col = 0 },
             .surface = try input_view.widget().draw(input_ctx),
             .z_index = 0,
         };
@@ -616,73 +616,73 @@ const ConversationLayout = struct {
     }
 };
 
-const TranscriptWidget = struct {
+const ThreadWidget = struct {
     app: *App,
 
-    fn widget(self: *TranscriptWidget) vxfw.Widget {
+    fn widget(self: *ThreadWidget) vxfw.Widget {
         return .{
             .userdata = self,
-            .drawFn = drawTranscript,
+            .drawFn = drawThread,
         };
     }
 
-    fn drawTranscript(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
+    fn drawThread(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const self: *ThreadWidget = @ptrCast(@alignCast(ptr));
         const widgets = try self.messageWidgets(ctx);
-        self.app.transcript_list.children = .{ .slice = widgets };
-        self.app.transcript_list.item_count = @intCast(widgets.len);
+        self.app.thread_list.children = .{ .slice = widgets };
+        self.app.thread_list.item_count = @intCast(widgets.len);
         self.syncCursor(ctx);
 
         var list_padding: vxfw.Padding = .{
-            .child = self.app.transcript_list.widget(),
+            .child = self.app.thread_list.widget(),
             .padding = ConversationLayout.verticalPadding(),
         };
         return list_padding.widget().draw(ctx);
     }
 
-    fn messageWidgets(self: *TranscriptWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
-        const messages = self.app.transcript.messages.items;
+    fn messageWidgets(self: *ThreadWidget, ctx: vxfw.DrawContext) ![]vxfw.Widget {
+        const messages = self.app.thread.messages.items;
         const widgets = try ctx.arena.alloc(vxfw.Widget, messages.len);
         const bodies = try ctx.arena.alloc(MessageWidget, messages.len);
         for (messages, 0..) |message, index| {
-            const selected = if (self.app.transcript.selected) |selected_index| selected_index == index else false;
+            const selected = if (self.app.thread.selected) |selected_index| selected_index == index else false;
             bodies[index] = .{ .message = message, .selected = selected, .loading_frame = self.app.loading_frame };
             widgets[index] = bodies[index].widget();
         }
         return widgets;
     }
 
-    fn syncCursor(self: *TranscriptWidget, ctx: vxfw.DrawContext) void {
-        const cursor = self.app.loading_index orelse self.app.transcript.selected orelse 0;
-        const cursor_changed = self.app.transcript_list.cursor != cursor;
-        self.app.transcript_list.cursor = cursor;
-        if (self.app.transcript_auto_scroll) {
+    fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
+        const cursor = self.app.loading_index orelse self.app.thread.selected orelse 0;
+        const cursor_changed = self.app.thread_list.cursor != cursor;
+        self.app.thread_list.cursor = cursor;
+        if (self.app.thread_auto_scroll) {
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
-        if (cursor_changed) self.app.transcript_list.ensureScroll();
+        if (cursor_changed) self.app.thread_list.ensureScroll();
     }
 
-    fn scrollCursorToTail(self: *TranscriptWidget, ctx: vxfw.DrawContext, cursor: u32) void {
-        if (cursor >= self.app.transcript.messages.items.len) return;
+    fn scrollCursorToTail(self: *ThreadWidget, ctx: vxfw.DrawContext, cursor: u32) void {
+        if (cursor >= self.app.thread.messages.items.len) return;
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
         const list_height = max_height -| ConversationLayout.top -| ConversationLayout.bottom;
-        const message = self.app.transcript.messages.items[cursor];
+        const message = self.app.thread.messages.items[cursor];
         const message_height = messageRows(message, ConversationLayout.contentWidth(max_width));
-        self.app.transcript_list.scroll.top = cursor;
-        self.app.transcript_list.scroll.pending_lines = 0;
-        self.app.transcript_list.scroll.wants_cursor = false;
+        self.app.thread_list.scroll.top = cursor;
+        self.app.thread_list.scroll.pending_lines = 0;
+        self.app.thread_list.scroll.wants_cursor = false;
         if (message_height > list_height) {
-            self.app.transcript_list.scroll.offset = @intCast(message_height - list_height);
+            self.app.thread_list.scroll.offset = @intCast(message_height - list_height);
         } else {
-            self.app.transcript_list.scroll.offset = 0;
+            self.app.thread_list.scroll.offset = 0;
         }
     }
 };
 
 const MessageWidget = struct {
-    message: transcript_mod.Message,
+    message: thread_mod.Message,
     selected: bool,
     loading_frame: u8,
 
@@ -915,12 +915,12 @@ const RowViewport = struct {
 };
 
 fn visibleRows(
-    messages: []const transcript_mod.Message,
+    messages: []const thread_mod.Message,
     selected: ?u32,
     width: u16,
     height: u16,
 ) RowViewport {
-    const total = transcriptRows(messages, width);
+    const total = threadRows(messages, width);
     if (total <= height) return .{ .first = 0, .height = height };
 
     const selected_index = selected orelse return .{
@@ -988,7 +988,7 @@ fn gradientChannel(start: u8, end: u8, numerator: u32, denominator: u32) u8 {
 }
 
 fn firstVisibleMessage(
-    messages: []const transcript_mod.Message,
+    messages: []const thread_mod.Message,
     selected: ?u32,
     width: u16,
     height: u16,
@@ -1004,7 +1004,7 @@ fn firstVisibleMessage(
     return 0;
 }
 
-fn transcriptRows(messages: []const transcript_mod.Message, width: u16) u32 {
+fn threadRows(messages: []const thread_mod.Message, width: u16) u32 {
     var rows: u32 = 0;
     for (messages) |message| {
         rows += messageRows(message, width);
@@ -1012,7 +1012,7 @@ fn transcriptRows(messages: []const transcript_mod.Message, width: u16) u32 {
     return rows;
 }
 
-fn messageStartRow(messages: []const transcript_mod.Message, index: u32, width: u16) u32 {
+fn messageStartRow(messages: []const thread_mod.Message, index: u32, width: u16) u32 {
     std.debug.assert(index < messages.len);
     var rows: u32 = 0;
     var current: u32 = 0;
@@ -1022,11 +1022,11 @@ fn messageStartRow(messages: []const transcript_mod.Message, index: u32, width: 
     return rows;
 }
 
-fn messageRows(message: transcript_mod.Message, width: u16) u16 {
+fn messageRows(message: thread_mod.Message, width: u16) u16 {
     return messageContentRows(message, width) + 2;
 }
 
-fn messageContentRows(message: transcript_mod.Message, width: u16) u16 {
+fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
     return switch (message.kind) {
         .user => textRows(message.body, width -| 2),
         .agent => textRows(message.body, width),
@@ -1078,7 +1078,7 @@ test "begin submit clears input and appends loading row before agent turn" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1089,11 +1089,11 @@ test "begin submit clears input and appends loading row before agent turn" {
 
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
-    try std.testing.expectEqualStrings("hello", app.transcript.messages.items[0].body);
-    try std.testing.expectEqual(.status, app.transcript.messages.items[loading_index].kind);
-    try std.testing.expect(isLoadingWord(app.transcript.messages.items[loading_index].title));
-    try std.testing.expectEqual(@as(u16, 3), messageRows(app.transcript.messages.items[loading_index], 80));
-    try std.testing.expectEqual(@as(u32, 0), app.transcript.selected.?);
+    try std.testing.expectEqualStrings("hello", app.thread.messages.items[0].body);
+    try std.testing.expectEqual(.status, app.thread.messages.items[loading_index].kind);
+    try std.testing.expect(isLoadingWord(app.thread.messages.items[loading_index].title));
+    try std.testing.expectEqual(@as(u16, 3), messageRows(app.thread.messages.items[loading_index], 80));
+    try std.testing.expectEqual(@as(u32, 0), app.thread.selected.?);
 }
 
 fn isLoadingWord(text: []const u8) bool {
@@ -1108,7 +1108,7 @@ test "empty text deltas do not create selectable messages" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1118,20 +1118,20 @@ test "empty text deltas do not create selectable messages" {
     _ = (try app.beginSubmit()).?;
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .content_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
 }
 
-test "agent app events update transcript on the ui side" {
+test "agent app events update thread on the ui side" {
     const gpa = std.testing.allocator;
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1153,13 +1153,13 @@ test "agent app events update transcript on the ui side" {
         .body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.thinking, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
-    try std.testing.expectEqualStrings("checking files", app.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.thinking, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqualStrings("checking files", app.thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[2].title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -1167,7 +1167,7 @@ test "user can navigate away from a streaming thinking block" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1177,13 +1177,13 @@ test "user can navigate away from a streaming thinking block" {
     _ = (try app.beginSubmit()).?;
 
     _ = try app.applyAgentEvent(.{ .reasoning_delta = "first chunk" });
-    try std.testing.expectEqual(.thinking, app.transcript.messages.items[app.transcript.selected.?].kind);
+    try std.testing.expectEqual(.thinking, app.thread.messages.items[app.thread.selected.?].kind);
 
-    app.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+    app.thread.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
-    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 }
 
 test "user can navigate away from a streaming agent message" {
@@ -1191,7 +1191,7 @@ test "user can navigate away from a streaming agent message" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1201,13 +1201,13 @@ test "user can navigate away from a streaming agent message" {
     _ = (try app.beginSubmit()).?;
 
     _ = try app.applyAgentEvent(.{ .content_delta = "first chunk" });
-    try std.testing.expectEqual(.agent, app.transcript.messages.items[app.transcript.selected.?].kind);
+    try std.testing.expectEqual(.agent, app.thread.messages.items[app.thread.selected.?].kind);
 
-    app.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+    app.thread.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .content_delta = " more" });
-    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 }
 
 test "empty content delta does not finalize thinking" {
@@ -1215,7 +1215,7 @@ test "empty content delta does not finalize thinking" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1226,16 +1226,16 @@ test "empty content delta does not finalize thinking" {
 
     _ = try app.applyAgentEvent(.{ .reasoning_delta = "thinking" });
     const thinking_index = app.thinking_index.?;
-    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .content_delta = "" });
-    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
-    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .content_delta = "answer" });
-    try std.testing.expectEqualStrings("Thoughts", app.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thoughts", app.thread.messages.items[thinking_index].title);
 }
 
 test "content deltas do not override user scroll state" {
@@ -1243,7 +1243,7 @@ test "content deltas do not override user scroll state" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1253,11 +1253,11 @@ test "content deltas do not override user scroll state" {
     _ = (try app.beginSubmit()).?;
 
     _ = try app.applyAgentEvent(.{ .content_delta = "first" });
-    try std.testing.expect(app.transcript_auto_scroll);
+    try std.testing.expect(app.thread_auto_scroll);
 
-    app.transcript_auto_scroll = false;
+    app.thread_auto_scroll = false;
     _ = try app.applyAgentEvent(.{ .content_delta = " second" });
-    try std.testing.expect(!app.transcript_auto_scroll);
+    try std.testing.expect(!app.thread_auto_scroll);
 }
 
 test "tool row persists through finish and turn completion" {
@@ -1265,7 +1265,7 @@ test "tool row persists through finish and turn completion" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1279,28 +1279,28 @@ test "tool row persists through finish and turn completion" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
         .index = 0,
         .command = "ls",
         .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -1308,7 +1308,7 @@ test "partial tool arguments do not create visible tool rows" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1322,18 +1322,18 @@ test "partial tool arguments do not create visible tool rows" {
         .name = "bash",
         .arguments = "{\"command\":\"",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.status, app.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -1341,7 +1341,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1361,17 +1361,17 @@ test "tool finish creates row if no complete streamed arguments appeared" {
         .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 2), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 }
 
-test "new tool response index creates a new transcript row" {
+test "new tool response index creates a new thread row" {
     const gpa = std.testing.allocator;
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1398,11 +1398,11 @@ test "new tool response index creates a new transcript row" {
         .arguments = "{\"command\":\"pwd\"}",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[2].kind);
-    try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[1].title);
-    try std.testing.expectEqualStrings("$ pwd", app.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+    try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
+    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
 }
 
 test "late tool finish does not move selection upward" {
@@ -1410,7 +1410,7 @@ test "late tool finish does not move selection upward" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1424,25 +1424,25 @@ test "late tool finish does not move selection upward" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 1), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
         .index = 0,
         .command = "ls",
         .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "done" }));
-    try std.testing.expectEqual(@as(u32, 3), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
 
 test "loading resumes after post-tool thinking delta" {
@@ -1450,7 +1450,7 @@ test "loading resumes after post-tool thinking delta" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1474,13 +1474,13 @@ test "loading resumes after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "checking output" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
-    try std.testing.expectEqual(@as(usize, 4), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.thinking, app.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(.status, app.transcript.messages.items[3].kind);
-    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[2].title);
-    try std.testing.expect(isLoadingWord(app.transcript.messages.items[3].title));
+    try std.testing.expectEqual(@as(usize, 4), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.thinking, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(.status, app.thread.messages.items[3].kind);
+    try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[2].title);
+    try std.testing.expect(isLoadingWord(app.thread.messages.items[3].title));
 }
 
 test "agent response after tool batch appears below tool rows" {
@@ -1488,7 +1488,7 @@ test "agent response after tool batch appears below tool rows" {
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1511,15 +1511,15 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "The repo is in /tmp." }));
 
-    try std.testing.expectEqual(@as(usize, 4), app.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(.agent, app.transcript.messages.items[3].kind);
-    try std.testing.expectEqualStrings("I will check.", app.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ pwd", app.transcript.messages.items[2].title);
-    try std.testing.expectEqualStrings("The repo is in /tmp.", app.transcript.messages.items[3].body);
-    try std.testing.expectEqual(@as(u32, 3), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(usize, 4), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+    try std.testing.expectEqual(.agent, app.thread.messages.items[3].kind);
+    try std.testing.expectEqualStrings("I will check.", app.thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
+    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.messages.items[3].body);
+    try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
 
 test "content delta after tool preview does not move selection away from tool row" {
@@ -1527,7 +1527,7 @@ test "content delta after tool preview does not move selection away from tool ro
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1538,7 +1538,7 @@ test "content delta after tool preview does not move selection away from tool ro
 
     try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "I will check." }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 1), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -1546,101 +1546,101 @@ test "content delta after tool preview does not move selection away from tool ro
         .arguments = "{\"command\":\"pwd\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = " Still checking." }));
     _ = try app.applyAgentEvent(.delta_end);
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
         .index = 0,
         .command = "pwd",
         .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.transcript.selected.?);
-    try std.testing.expectEqualStrings("I will check. Still checking.", app.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("$ pwd", app.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
+    try std.testing.expectEqualStrings("I will check. Still checking.", app.thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("$ pwd", app.thread.messages.items[2].title);
 }
 
 test "collapsed thinking and tool rows have stable heights" {
     const gpa = std.testing.allocator;
-    var transcript: transcript_mod.Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
 
-    const thinking_index = try transcript.append(gpa, .thinking, "Thinking...", "short");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(transcript.messages.items[thinking_index], 80));
+    const thinking_index = try thread.append(gpa, .thinking, "Thinking...", "short");
+    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[thinking_index], 80));
 
-    try transcript.appendThinkingDelta(gpa, thinking_index, " ");
-    try transcript.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(transcript.messages.items[thinking_index], 80));
+    try thread.appendThinkingDelta(gpa, thinking_index, " ");
+    try thread.appendThinkingDelta(gpa, thinking_index, "this is a much longer thinking body that should not change the collapsed row height");
+    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[thinking_index], 80));
 
-    const tool_index = try transcript.startTool(gpa, "pwd");
-    try std.testing.expectEqual(@as(u16, 3), messageRows(transcript.messages.items[tool_index], 80));
+    const tool_index = try thread.startTool(gpa, "pwd");
+    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[tool_index], 80));
 }
 
 test "first visible message tracks bottom viewport row" {
     const gpa = std.testing.allocator;
-    var transcript: transcript_mod.Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
 
-    _ = try transcript.append(gpa, .user, "you", "one");
-    _ = try transcript.append(gpa, .agent, "agent", "two");
-    _ = try transcript.append(gpa, .agent, "agent", "three");
+    _ = try thread.append(gpa, .user, "you", "one");
+    _ = try thread.append(gpa, .agent, "agent", "two");
+    _ = try thread.append(gpa, .agent, "agent", "three");
 
     try std.testing.expectEqual(
         @as(u32, 1),
-        firstVisibleMessage(transcript.messages.items, transcript.selected, 80, 6),
+        firstVisibleMessage(thread.messages.items, thread.selected, 80, 6),
     );
 }
 
 test "latest tall message scrolls by rows instead of message boundaries" {
     const gpa = std.testing.allocator;
-    var transcript: transcript_mod.Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
 
-    _ = try transcript.append(gpa, .agent, "agent", "one");
-    _ = try transcript.append(gpa, .agent, "agent", "line1\nline2\nline3\nline4\nline5\nline6");
+    _ = try thread.append(gpa, .agent, "agent", "one");
+    _ = try thread.append(gpa, .agent, "agent", "line1\nline2\nline3\nline4\nline5\nline6");
 
-    const viewport = visibleRows(transcript.messages.items, transcript.selected, 80, 4);
+    const viewport = visibleRows(thread.messages.items, thread.selected, 80, 4);
     try std.testing.expectEqual(@as(u32, 7), viewport.first);
-    try std.testing.expectEqual(@as(u32, 11), transcriptRows(transcript.messages.items, 80));
+    try std.testing.expectEqual(@as(u32, 11), threadRows(thread.messages.items, 80));
 }
 
 test "collapsed tool messages render no body text" {
     const gpa = std.testing.allocator;
-    var transcript: transcript_mod.Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
 
-    const index = try transcript.startTool(gpa, "printf hello");
-    try transcript.finishTool(gpa, index, "stdout:\nhello\nstderr:\n");
+    const index = try thread.startTool(gpa, "printf hello");
+    try thread.finishTool(gpa, index, "stdout:\nhello\nstderr:\n");
 
-    try std.testing.expect(!transcript.messages.items[index].expanded);
-    try std.testing.expectEqual(@as(u16, 3), messageRows(transcript.messages.items[index], 80));
-    transcript.toggleSelected();
-    try std.testing.expect(transcript.messages.items[index].expanded);
-    try std.testing.expectEqualStrings("stdout:\nhello\nstderr:\n", transcript.messages.items[index].body);
+    try std.testing.expect(!thread.messages.items[index].expanded);
+    try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[index], 80));
+    thread.toggleSelected();
+    try std.testing.expect(thread.messages.items[index].expanded);
+    try std.testing.expectEqualStrings("stdout:\nhello\nstderr:\n", thread.messages.items[index].body);
 }
 
 test "selected collapsed tools stay visible for tight viewport heights" {
     const gpa = std.testing.allocator;
-    var transcript: transcript_mod.Transcript = .{};
-    defer transcript.deinit(gpa);
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
 
-    _ = try transcript.append(gpa, .agent, "agent", "one two three four five six seven eight nine ten");
-    const tool_index = try transcript.startTool(gpa, "zig build test");
-    _ = try transcript.append(gpa, .agent, "agent", "done");
+    _ = try thread.append(gpa, .agent, "agent", "one two three four five six seven eight nine ten");
+    const tool_index = try thread.startTool(gpa, "zig build test");
+    _ = try thread.append(gpa, .agent, "agent", "done");
 
-    transcript.selected = tool_index;
+    thread.selected = tool_index;
     var height: u16 = 1;
     while (height <= 8) : (height += 1) {
-        const first = firstVisibleMessage(transcript.messages.items, transcript.selected, 12, height);
+        const first = firstVisibleMessage(thread.messages.items, thread.selected, 12, height);
         try std.testing.expect(first <= tool_index);
-        try std.testing.expect(selectedRowFits(transcript.messages.items, transcript.selected.?, 12, height));
+        try std.testing.expect(selectedRowFits(thread.messages.items, thread.selected.?, 12, height));
     }
 }
 
 fn selectedRowFits(
-    messages: []const transcript_mod.Message,
+    messages: []const thread_mod.Message,
     selected: u32,
     width: u16,
     height: u16,
