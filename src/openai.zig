@@ -6,43 +6,69 @@ const Scanner = std.json.Scanner;
 const redirect_buffer_bytes: u32 = 8192;
 const transfer_buffer_bytes: u32 = 4096;
 const body_buffer_bytes: u32 = 4096;
+const tool_call_count_max: u32 = 16;
+const stream_chunk_count_max: u32 = 100_000;
+const stream_bytes_max: u32 = 8 * 1024 * 1024;
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     config: ai.Config,
+    url: []u8,
+    authorization: []u8,
+    http_client: std.http.Client,
+
+    pub fn init(
+        target: *Client,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        config: ai.Config,
+    ) !void {
+        std.debug.assert(config.base_url.len > 0);
+        std.debug.assert(config.model.len > 0);
+
+        const url = try std.fmt.allocPrint(
+            gpa,
+            "{s}/v1/chat/completions",
+            .{std.mem.trimEnd(u8, config.base_url, "/")},
+        );
+        errdefer gpa.free(url);
+
+        const authorization = try std.fmt.allocPrint(
+            gpa,
+            "Bearer {s}",
+            .{config.api_key},
+        );
+        errdefer gpa.free(authorization);
+
+        target.* = .{
+            .gpa = gpa,
+            .io = io,
+            .config = config,
+            .url = url,
+            .authorization = authorization,
+            .http_client = .{ .allocator = gpa, .io = io },
+        };
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.http_client.deinit();
+        self.gpa.free(self.authorization);
+        self.gpa.free(self.url);
+        self.* = undefined;
+    }
 
     pub fn completeStream(
         self: *Client,
         messages: []const ai.ChatMessage,
         observer: ai.StreamObserver,
     ) !ai.Response {
-        std.debug.assert(self.config.base_url.len > 0);
-        std.debug.assert(self.config.model.len > 0);
+        std.debug.assert(self.url.len > 0);
+        std.debug.assert(self.authorization.len > 0);
 
-        const url = try std.fmt.allocPrint(
-            self.gpa,
-            "{s}/v1/chat/completions",
-            .{std.mem.trimEnd(u8, self.config.base_url, "/")},
-        );
-        defer self.gpa.free(url);
-
-        const authorization = try std.fmt.allocPrint(
-            self.gpa,
-            "Bearer {s}",
-            .{self.config.api_key},
-        );
-        defer self.gpa.free(authorization);
-
-        var http_client: std.http.Client = .{
-            .allocator = self.gpa,
-            .io = self.io,
-        };
-        defer http_client.deinit();
-
-        var req = try http_client.request(.POST, try std.Uri.parse(url), .{
+        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
-                .authorization = .{ .override = authorization },
+                .authorization = .{ .override = self.authorization },
                 .content_type = .{ .override = "application/json" },
             },
         });
@@ -58,7 +84,9 @@ pub const Client = struct {
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = try req.receiveHead(&redirect_buffer);
         const status_code: u16 = @intFromEnum(http_response.head.status);
-        if (status_code < 200 or status_code >= 300) return error.HttpStatus;
+        if (status_code >= 500) return error.HttpServerError;
+        if (status_code >= 400) return error.HttpClientError;
+        if (status_code < 200 or status_code >= 300) return error.HttpUnexpectedStatus;
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
@@ -101,7 +129,7 @@ const ToolCallBuilder = struct {
         self.* = undefined;
     }
 
-    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, index: usize) !ai.ToolCall {
+    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, index: u32) !ai.ToolCall {
         return .{
             .index = index,
             .id = try self.id.toOwnedSlice(gpa),
@@ -128,12 +156,18 @@ fn readStream(
         builders.deinit(gpa);
     }
 
+    var chunk_count: u32 = 0;
+    var bytes_read: u32 = 0;
     while (try reader.takeDelimiter('\n')) |line| {
+        chunk_count += 1;
+        bytes_read +|= @intCast(line.len);
+        if (chunk_count > stream_chunk_count_max) return error.StreamTooManyChunks;
+        if (bytes_read > stream_bytes_max) return error.StreamTooLarge;
         const trimmed = std.mem.trim(u8, line, " \r");
         if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
         const data = std.mem.trim(u8, trimmed["data:".len..], " ");
         if (std.mem.eql(u8, data, "[DONE]")) break;
-        try parseStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
+        try processStreamChunk(gpa, data, &content, &reasoning, &builders, observer);
     }
 
     var result: ai.Response = .{
@@ -142,11 +176,74 @@ fn readStream(
     };
     errdefer result.deinit(gpa);
 
-    for (builders.items, 0..) |*builder, index| {
+    for (builders.items, 0..) |*builder, i| {
         if (builder.name.items.len == 0) continue;
+        const index: u32 = @intCast(i);
         try result.tool_calls.append(gpa, try builder.toToolCall(gpa, index));
     }
     return result;
+}
+
+const ChunkChange = struct {
+    content_start: ?u32 = null,
+    reasoning_start: ?u32 = null,
+    tool_call_indexes: [tool_call_count_max]u32 = @splat(0),
+    tool_call_count: u32 = 0,
+
+    fn empty(self: *const ChunkChange) bool {
+        if (self.content_start != null) return false;
+        if (self.reasoning_start != null) return false;
+        if (self.tool_call_count > 0) return false;
+        return true;
+    }
+
+    fn recordToolCall(self: *ChunkChange, index: u32) void {
+        for (self.tool_call_indexes[0..self.tool_call_count]) |existing| {
+            if (existing == index) return;
+        }
+        std.debug.assert(self.tool_call_count < tool_call_count_max);
+        self.tool_call_indexes[self.tool_call_count] = index;
+        self.tool_call_count += 1;
+    }
+};
+
+fn applyChunkCallbacks(
+    change: ChunkChange,
+    content: []const u8,
+    reasoning: []const u8,
+    builders: []const ToolCallBuilder,
+    observer: ai.StreamObserver,
+) !void {
+    if (change.content_start) |start| {
+        if (observer.on_content_delta) |callback| {
+            try callback(observer.context, content[start..]);
+        }
+    }
+    if (change.reasoning_start) |start| {
+        if (observer.on_reasoning_delta) |callback| {
+            try callback(observer.context, reasoning[start..]);
+        }
+    }
+    for (change.tool_call_indexes[0..change.tool_call_count]) |idx| {
+        const builder = builders[idx];
+        if (observer.on_tool_delta) |callback| {
+            try callback(observer.context, idx, builder.name.items, builder.arguments.items);
+        }
+    }
+    if (change.empty()) return;
+    if (observer.on_delta_end) |callback| try callback(observer.context);
+}
+
+fn processStreamChunk(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    content: *std.ArrayList(u8),
+    reasoning: *std.ArrayList(u8),
+    builders: *std.ArrayList(ToolCallBuilder),
+    observer: ai.StreamObserver,
+) !void {
+    const change = try parseStreamChunk(gpa, data, content, reasoning, builders);
+    try applyChunkCallbacks(change, content.items, reasoning.items, builders.items, observer);
 }
 
 fn parseStreamChunk(
@@ -155,25 +252,22 @@ fn parseStreamChunk(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-) !void {
+) !ChunkChange {
     std.debug.assert(data.len > 0);
 
     var scanner = Scanner.initCompleteInput(gpa, data);
     defer scanner.deinit();
 
-    var changed = false;
+    var change: ChunkChange = .{};
     try expectObjectBegin(&scanner);
     while (try nextObjectKey(&scanner)) |key| {
         if (std.mem.eql(u8, key, "choices")) {
-            try parseChoicesArray(gpa, &scanner, content, reasoning, builders, observer, &changed);
+            try parseChoicesArray(gpa, &scanner, content, reasoning, builders, &change);
         } else {
             try scanner.skipValue();
         }
     }
-
-    if (!changed) return;
-    if (observer.on_delta_end) |callback| try callback(observer.context);
+    return change;
 }
 
 fn parseChoicesArray(
@@ -182,8 +276,7 @@ fn parseChoicesArray(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-    changed: *bool,
+    change: *ChunkChange,
 ) !void {
     try expectArrayBegin(scanner);
     var saw_first = false;
@@ -198,7 +291,7 @@ fn parseChoicesArray(
             continue;
         }
         try expectObjectBegin(scanner);
-        try parseChoiceObject(gpa, scanner, content, reasoning, builders, observer, changed);
+        try parseChoiceObject(gpa, scanner, content, reasoning, builders, change);
         saw_first = true;
     }
 }
@@ -209,12 +302,11 @@ fn parseChoiceObject(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-    changed: *bool,
+    change: *ChunkChange,
 ) !void {
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "delta")) {
-            try parseDeltaObject(gpa, scanner, content, reasoning, builders, observer, changed);
+            try parseDeltaObject(gpa, scanner, content, reasoning, builders, change);
         } else {
             try scanner.skipValue();
         }
@@ -227,27 +319,20 @@ fn parseDeltaObject(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-    changed: *bool,
+    change: *ChunkChange,
 ) !void {
     try expectObjectBegin(scanner);
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "content")) {
-            const before = content.items.len;
+            const before: u32 = @intCast(content.items.len);
             try appendStringValue(scanner, gpa, content);
-            changed.* = true;
-            if (observer.on_content_delta) |callback| {
-                try callback(observer.context, content.items[before..]);
-            }
+            change.content_start = before;
         } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
-            const before = reasoning.items.len;
+            const before: u32 = @intCast(reasoning.items.len);
             try appendStringValue(scanner, gpa, reasoning);
-            changed.* = true;
-            if (observer.on_reasoning_delta) |callback| {
-                try callback(observer.context, reasoning.items[before..]);
-            }
+            change.reasoning_start = before;
         } else if (std.mem.eql(u8, key, "tool_calls")) {
-            try parseToolCallsArray(gpa, scanner, builders, observer, changed);
+            try parseToolCallsArray(gpa, scanner, builders, change);
         } else {
             try scanner.skipValue();
         }
@@ -258,8 +343,7 @@ fn parseToolCallsArray(
     gpa: std.mem.Allocator,
     scanner: *Scanner,
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-    changed: *bool,
+    change: *ChunkChange,
 ) !void {
     try expectArrayBegin(scanner);
     while (true) {
@@ -269,7 +353,7 @@ fn parseToolCallsArray(
             return;
         }
         try expectObjectBegin(scanner);
-        try parseToolCallObject(gpa, scanner, builders, observer, changed);
+        try parseToolCallObject(gpa, scanner, builders, change);
     }
 }
 
@@ -277,20 +361,20 @@ fn parseToolCallObject(
     gpa: std.mem.Allocator,
     scanner: *Scanner,
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: ai.StreamObserver,
-    changed: *bool,
+    change: *ChunkChange,
 ) !void {
     var pending: ToolCallBuilder = .{};
     defer pending.deinit(gpa);
     var has_pending_id = false;
     var has_pending_name = false;
     var has_pending_arguments = false;
-    var resolved_index: ?usize = null;
+    var resolved_index: ?u32 = null;
 
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "index")) {
             const index = try nextInteger(scanner);
             if (index < 0) return error.InvalidToolCallIndex;
+            if (index >= tool_call_count_max) return error.TooManyToolCalls;
             resolved_index = @intCast(index);
         } else if (std.mem.eql(u8, key, "id")) {
             try appendStringValue(scanner, gpa, &pending.id);
@@ -304,25 +388,15 @@ fn parseToolCallObject(
 
     const idx = resolved_index orelse return;
     while (builders.items.len <= idx) try builders.append(gpa, .{});
-    const target = &builders.items[idx];
+    const target = &builders.items[@as(usize, idx)];
 
-    if (has_pending_id) {
-        try target.id.appendSlice(gpa, pending.id.items);
-        changed.* = true;
-    }
-    if (has_pending_name) {
-        try target.name.appendSlice(gpa, pending.name.items);
-        changed.* = true;
-    }
-    if (has_pending_arguments) {
-        try target.arguments.appendSlice(gpa, pending.arguments.items);
-        changed.* = true;
-    }
-
-    if (observer.on_tool_delta) |callback| {
-        try callback(observer.context, idx, target.name.items, target.arguments.items);
-    }
+    if (has_pending_id) try target.id.appendSlice(gpa, pending.id.items);
+    if (has_pending_name) try target.name.appendSlice(gpa, pending.name.items);
+    if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
+    change.recordToolCall(idx);
 }
+
+
 
 fn parseToolCallFunction(
     gpa: std.mem.Allocator,
@@ -408,9 +482,9 @@ test "parse streaming tool deltas as they arrive" {
     const Seen = struct {
         name: []const u8 = "",
         arguments: []const u8 = "",
-        index: usize = 0,
+        index: u32 = 0,
 
-        fn onToolDelta(context: ?*anyopaque, index: usize, name: []const u8, arguments: []const u8) !void {
+        fn onToolDelta(context: ?*anyopaque, index: u32, name: []const u8, arguments: []const u8) !void {
             const seen: *@This() = @ptrCast(@alignCast(context.?));
             seen.index = index;
             seen.name = name;
@@ -419,13 +493,13 @@ test "parse streaming tool deltas as they arrive" {
     };
     var seen: Seen = .{};
 
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
         .on_tool_delta = Seen.onToolDelta,
     });
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" build\"}"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -434,7 +508,7 @@ test "parse streaming tool deltas as they arrive" {
 
     try std.testing.expectEqualStrings("bash", seen.name);
     try std.testing.expectEqualStrings("{\"command\":\"zig build\"}", seen.arguments);
-    try std.testing.expectEqual(@as(usize, 0), seen.index);
+    try std.testing.expectEqual(@as(u32, 0), seen.index);
 }
 
 test "parse streaming tool deltas tolerate key reorder" {
@@ -451,7 +525,7 @@ test "parse streaming tool deltas tolerate key reorder" {
         builders.deinit(gpa);
     }
 
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"function":{"name":"bash","arguments":"{}"},"id":"call_1","index":0}]}}]}
     , &content, &reasoning, &builders, .{});
 
@@ -479,7 +553,7 @@ test "parse streaming tool deltas batches render notification per event" {
         tool_delta_count: u32 = 0,
         render_count: u32 = 0,
 
-        fn onToolDelta(context: ?*anyopaque, _: usize, _: []const u8, _: []const u8) !void {
+        fn onToolDelta(context: ?*anyopaque, _: u32, _: []const u8, _: []const u8) !void {
             const seen: *@This() = @ptrCast(@alignCast(context.?));
             seen.tool_delta_count += 1;
         }
@@ -491,7 +565,7 @@ test "parse streaming tool deltas batches render notification per event" {
     };
     var seen: Seen = .{};
 
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -533,7 +607,7 @@ test "parse streaming reasoning deltas as they arrive" {
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
 
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
@@ -574,13 +648,13 @@ test "parse streaming content deltas as they arrive" {
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
 
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,
         .on_content_delta = Seen.onContentDelta,
     });
-    try parseStreamChunk(gpa,
+    try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"lo"}}]}
     , &content, &reasoning, &builders, .{
         .context = &seen,

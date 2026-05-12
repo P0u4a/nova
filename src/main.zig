@@ -7,11 +7,9 @@ pub fn main(init: std.process.Init) !void {
     const api_key = init.environ_map.get("OPENAI_API_KEY") orelse "";
     const model = init.environ_map.get("OPENAI_MODEL") orelse "gpt-5.5";
 
-    var openai_client: nova.openai.Client = .{
-        .gpa = gpa,
-        .io = init.io,
-        .config = .{ .base_url = base_url, .api_key = api_key, .model = model },
-    };
+    var openai_client: nova.openai.Client = undefined;
+    try openai_client.init(gpa, init.io, .{ .base_url = base_url, .api_key = api_key, .model = model });
+    defer openai_client.deinit();
 
     var agent = nova.agent.Agent.init(gpa, init.io, .{ .openai = &openai_client });
     defer agent.deinit();
