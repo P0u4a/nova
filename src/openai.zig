@@ -1,68 +1,16 @@
 const std = @import("std");
-
-pub const Config = struct {
-    base_url: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-};
-
-pub const ChatMessage = struct {
-    role: []const u8,
-    content: []const u8,
-};
-
-pub const ToolCall = struct {
-    index: usize,
-    id: []u8,
-    name: []u8,
-    arguments: []u8,
-
-    pub fn deinit(self: *ToolCall, gpa: std.mem.Allocator) void {
-        gpa.free(self.id);
-        gpa.free(self.name);
-        gpa.free(self.arguments);
-        self.* = undefined;
-    }
-};
-
-pub const Response = struct {
-    content: []u8,
-    reasoning: []u8,
-    tool_calls: std.ArrayList(ToolCall) = .empty,
-
-    pub fn deinit(self: *Response, gpa: std.mem.Allocator) void {
-        gpa.free(self.content);
-        gpa.free(self.reasoning);
-        for (self.tool_calls.items) |*tool_call| {
-            tool_call.deinit(gpa);
-        }
-        self.tool_calls.deinit(gpa);
-        self.* = undefined;
-    }
-};
-
-pub const StreamObserver = struct {
-    context: ?*anyopaque = null,
-    on_content_delta: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
-    on_reasoning_delta: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
-    on_tool_delta: ?*const fn (?*anyopaque, usize, []const u8, []const u8) anyerror!void = null,
-    on_delta_end: ?*const fn (?*anyopaque) anyerror!void = null,
-};
+const ai = @import("ai.zig");
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    config: Config,
-
-    pub fn complete(self: *Client, messages: []const ChatMessage) !Response {
-        return try self.completeStream(messages, .{});
-    }
+    config: ai.Config,
 
     pub fn completeStream(
         self: *Client,
-        messages: []const ChatMessage,
-        observer: StreamObserver,
-    ) !Response {
+        messages: []const ai.ChatMessage,
+        observer: ai.StreamObserver,
+    ) !ai.Response {
         const url = try std.fmt.allocPrint(
             self.gpa,
             "{s}/v1/chat/completions",
@@ -105,7 +53,7 @@ pub const Client = struct {
         return try readStream(self.gpa, reader, observer);
     }
 
-    fn requestPayload(self: *Client, messages: []const ChatMessage, stream: bool) ![]u8 {
+    fn requestPayload(self: *Client, messages: []const ai.ChatMessage, stream: bool) ![]u8 {
         var writer: std.Io.Writer.Allocating = .init(self.gpa);
         defer writer.deinit();
         const out = &writer.writer;
@@ -145,7 +93,7 @@ const ToolCallBuilder = struct {
         self.* = undefined;
     }
 
-    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, index: usize) !ToolCall {
+    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, index: usize) !ai.ToolCall {
         return .{
             .index = index,
             .id = try self.id.toOwnedSlice(gpa),
@@ -158,8 +106,8 @@ const ToolCallBuilder = struct {
 fn readStream(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
-    observer: StreamObserver,
-) !Response {
+    observer: ai.StreamObserver,
+) !ai.Response {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
     var reasoning: std.ArrayList(u8) = .empty;
@@ -180,7 +128,7 @@ fn readStream(
         try parseStreamData(gpa, data, &content, &reasoning, &builders, observer);
     }
 
-    var result: Response = .{
+    var result: ai.Response = .{
         .content = try content.toOwnedSlice(gpa),
         .reasoning = try reasoning.toOwnedSlice(gpa),
     };
@@ -199,7 +147,7 @@ fn parseStreamData(
     content: *std.ArrayList(u8),
     reasoning: *std.ArrayList(u8),
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: StreamObserver,
+    observer: ai.StreamObserver,
 ) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, data, .{
         .ignore_unknown_fields = true,
@@ -247,7 +195,7 @@ fn parseToolCallDelta(
     gpa: std.mem.Allocator,
     item: std.json.Value,
     builders: *std.ArrayList(ToolCallBuilder),
-    observer: StreamObserver,
+    observer: ai.StreamObserver,
 ) !bool {
     const index_value = item.object.get("index") orelse return false;
     if (index_value != .integer) return false;
@@ -278,7 +226,7 @@ fn parseToolCallDelta(
     return changed;
 }
 
-pub fn parseResponse(gpa: std.mem.Allocator, body: []const u8) !Response {
+pub fn parseResponse(gpa: std.mem.Allocator, body: []const u8) !ai.Response {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{
         .ignore_unknown_fields = true,
     });
@@ -290,7 +238,7 @@ pub fn parseResponse(gpa: std.mem.Allocator, body: []const u8) !Response {
     const reasoning = jsonString(message.object.get("reasoning")) orelse
         jsonString(message.object.get("reasoning_content")) orelse "";
 
-    var response: Response = .{
+    var response: ai.Response = .{
         .content = try gpa.dupe(u8, jsonString(message.object.get("content")) orelse ""),
         .reasoning = try gpa.dupe(u8, reasoning),
     };

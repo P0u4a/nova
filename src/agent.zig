@@ -1,17 +1,19 @@
 const std = @import("std");
 
+const ai = @import("ai.zig");
 const bash = @import("bash.zig");
-const openai = @import("openai.zig");
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
-    client: openai.Client,
-    messages: std.ArrayList(openai.ChatMessage) = .empty,
+    io: std.Io,
+    client: ai.AIClient,
+    messages: std.ArrayList(ai.ChatMessage) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, config: openai.Config) Agent {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: ai.AIClient) Agent {
         return .{
             .gpa = gpa,
-            .client = .{ .gpa = gpa, .io = io, .config = config },
+            .io = io,
+            .client = client,
         };
     }
 
@@ -99,7 +101,7 @@ pub const Agent = struct {
 
     fn runTools(
         self: *Agent,
-        tool_calls: []const openai.ToolCall,
+        tool_calls: []const ai.ToolCall,
         stream_context: *const StreamContext,
         events: Events,
     ) !void {
@@ -132,7 +134,7 @@ pub const Agent = struct {
             try postEvent(events, .delta_end);
         }
 
-        var result = try bash.run(self.gpa, self.client.io, command);
+        var result = try bash.run(self.gpa, self.io, command);
         defer result.deinit(self.gpa);
 
         const tool_body = try std.fmt.allocPrint(
@@ -270,11 +272,13 @@ test "parse bash command arguments" {
 
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
-    var agent = Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    const openai = @import("openai.zig");
+    var openai_client: openai.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     const Seen = struct {
