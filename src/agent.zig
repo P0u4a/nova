@@ -6,13 +6,15 @@ const bash = @import("bash.zig");
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    cwd: []const u8,
     client: ai.AIClient,
     messages: std.ArrayList(ai.ChatMessage) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: ai.AIClient) Agent {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.AIClient) Agent {
         return .{
             .gpa = gpa,
             .io = io,
+            .cwd = cwd,
             .client = client,
         };
     }
@@ -134,7 +136,10 @@ pub const Agent = struct {
             try postEvent(events, .delta_end);
         }
 
-        var result = try bash.run(self.gpa, self.io, command);
+        var result = if (try bash.commands.tryHandle(self.gpa, self.io, self.cwd, command)) |intercepted|
+            intercepted
+        else
+            try bash.run(self.gpa, self.io, self.cwd, command);
         defer result.deinit(self.gpa);
 
         const tool_body = try std.fmt.allocPrint(
@@ -276,7 +281,7 @@ test "streaming callbacks emit owned events" {
     var openai_client: openai.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();
-    var agent = Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
     defer agent.deinit();
 
     const Seen = struct {
