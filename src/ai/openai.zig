@@ -327,11 +327,11 @@ fn parseDeltaObject(
         if (std.mem.eql(u8, key, "content")) {
             const before: u32 = @intCast(content.items.len);
             try appendStringValue(scanner, gpa, content);
-            change.content_start = before;
+            if (content.items.len > before) change.content_start = before;
         } else if (std.mem.eql(u8, key, "reasoning") or std.mem.eql(u8, key, "reasoning_content")) {
             const before: u32 = @intCast(reasoning.items.len);
             try appendStringValue(scanner, gpa, reasoning);
-            change.reasoning_start = before;
+            if (reasoning.items.len > before) change.reasoning_start = before;
         } else if (std.mem.eql(u8, key, "tool_calls")) {
             try parseToolCallsArray(gpa, scanner, builders, change);
         } else {

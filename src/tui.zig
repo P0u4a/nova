@@ -128,10 +128,11 @@ pub const App = struct {
         switch (event) {
             .content_delta => |delta| {
                 self.removeLoading();
+                if (delta.len == 0) return false;
                 _ = try self.finishThinking();
                 try self.applyContentDelta(delta);
                 self.pending_redraw = true;
-                return delta.len > 0;
+                return true;
             },
             .reasoning_delta => |delta| {
                 self.removeLoading();
@@ -1207,6 +1208,34 @@ test "user can navigate away from a streaming agent message" {
 
     _ = try app.applyAgentEvent(.{ .content_delta = " more" });
     try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+}
+
+test "empty content delta does not finalize thinking" {
+    const gpa = std.testing.allocator;
+    var openai_client: openai_mod.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("hello");
+    _ = (try app.beginSubmit()).?;
+
+    _ = try app.applyAgentEvent(.{ .reasoning_delta = "thinking" });
+    const thinking_index = app.thinking_index.?;
+    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+
+    _ = try app.applyAgentEvent(.{ .content_delta = "" });
+    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+
+    _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
+    try std.testing.expectEqualStrings("Thinking...", app.transcript.messages.items[thinking_index].title);
+
+    _ = try app.applyAgentEvent(.{ .content_delta = "answer" });
+    try std.testing.expectEqualStrings("Thoughts", app.transcript.messages.items[thinking_index].title);
 }
 
 test "content deltas do not override user scroll state" {
