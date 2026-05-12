@@ -206,7 +206,7 @@ pub const App = struct {
             self.agent_index = try self.transcript.append(self.gpa, .agent, "agent", delta);
         }
         if (!self.tool_seen_in_response) {
-            self.transcript.select(self.agent_index.?);
+            self.selectGeneratedMessage(self.agent_index.?);
             self.transcript_auto_scroll = true;
         }
     }
@@ -233,13 +233,14 @@ pub const App = struct {
                 delta,
             );
             self.agent_index = agent_index + 1;
+            self.transcript.select(self.thinking_index.?);
             visible_change = true;
         } else {
             self.thinking_index = try self.transcript.append(self.gpa, .thinking, "Thinking...", delta);
             visible_change = true;
         }
         if (self.agent_index == null and !self.tool_seen_in_response) {
-            self.transcript.select(self.thinking_index.?);
+            self.selectGeneratedMessage(self.thinking_index.?);
         }
         return visible_change;
     }
@@ -281,7 +282,7 @@ pub const App = struct {
 
     fn selectGeneratedMessage(self: *App, index: u32) void {
         if (self.transcript.selected) |selected| {
-            if (index < selected) return;
+            if (selected != index) return;
         }
         self.transcript.select(index);
     }
@@ -1080,7 +1081,7 @@ test "begin submit clears input and appends loading row before agent turn" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
@@ -1111,7 +1112,7 @@ test "empty text deltas do not create selectable messages" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
@@ -1135,7 +1136,7 @@ test "agent app events update transcript on the ui side" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("hello");
@@ -1163,6 +1164,56 @@ test "agent app events update transcript on the ui side" {
     try std.testing.expectEqualStrings("$ ls", app.transcript.messages.items[2].title);
 }
 
+test "user can navigate away from a streaming thinking block" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1",
+        .api_key = "test",
+        .model = "test",
+    });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("hello");
+    _ = (try app.beginSubmit()).?;
+
+    _ = try app.applyAgentEvent(.{ .reasoning_delta = "first chunk" });
+    try std.testing.expectEqual(.thinking, app.transcript.messages.items[app.transcript.selected.?].kind);
+
+    app.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+
+    _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
+    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+}
+
+test "user can navigate away from a streaming agent message" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1",
+        .api_key = "test",
+        .model = "test",
+    });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("hello");
+    _ = (try app.beginSubmit()).?;
+
+    _ = try app.applyAgentEvent(.{ .content_delta = "first chunk" });
+    try std.testing.expectEqual(.agent, app.transcript.messages.items[app.transcript.selected.?].kind);
+
+    app.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+
+    _ = try app.applyAgentEvent(.{ .content_delta = " more" });
+    try std.testing.expectEqual(.user, app.transcript.messages.items[app.transcript.selected.?].kind);
+}
+
 test "tool row persists through finish and turn completion" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
@@ -1172,7 +1223,7 @@ test "tool row persists through finish and turn completion" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -1216,7 +1267,7 @@ test "partial tool arguments do not create visible tool rows" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -1250,7 +1301,7 @@ test "tool finish creates row if no complete streamed arguments appeared" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run ls");
@@ -1281,7 +1332,7 @@ test "new tool response index creates a new transcript row" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
@@ -1321,7 +1372,7 @@ test "late tool finish does not move selection upward" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("run tools");
@@ -1362,7 +1413,7 @@ test "loading resumes after post-tool thinking delta" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -1401,7 +1452,7 @@ test "agent response after tool batch appears below tool rows" {
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
@@ -1441,7 +1492,7 @@ test "content delta after tool preview does not move selection away from tool ro
     });
     defer agent.deinit();
 
-    var app = App.init(std.testing.io, gpa, &agent, null);
+    var app = App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
     try app.input.insertSliceAtCursor("inspect");
