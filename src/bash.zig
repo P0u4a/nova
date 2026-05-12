@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Result = struct {
     stdout: []u8,
@@ -14,7 +15,7 @@ pub const Result = struct {
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, command: []const u8) !Result {
     const child_result = try std.process.run(gpa, io, .{
-        .argv = &.{ "bash", "-lc", command },
+        .argv = &.{ bashPath(io), "-lc", command },
         .stdout_limit = .limited(512 * 1024),
         .stderr_limit = .limited(512 * 1024),
     });
@@ -30,6 +31,34 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, command: []const u8) !Result {
         .stderr = child_result.stderr,
         .code = code,
     };
+}
+
+// On Windows, `bash` on PATH may resolve to the WSL bash bridge in
+// system32, which talks to a Windows service that intermittently exhausts
+// socket buffers (WSAENOBUFS / Bash/Service/0x80072747). Prefer git bash when
+// available.
+const windows_bash_candidates = [_][]const u8{
+    "C:\\Program Files\\Git\\bin\\bash.exe",
+    "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+};
+
+// TODO: Persist this
+var bash_path_value: ?[]const u8 = null;
+
+fn bashPath(io: std.Io) []const u8 {
+    if (bash_path_value) |p| return p;
+    const resolved = resolveBashPath(io);
+    bash_path_value = resolved;
+    return resolved;
+}
+
+fn resolveBashPath(io: std.Io) []const u8 {
+    if (builtin.os.tag != .windows) return "bash";
+    for (windows_bash_candidates) |path| {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch continue;
+        return path;
+    }
+    return "bash";
 }
 
 test "bash captures stdout and exit code" {
