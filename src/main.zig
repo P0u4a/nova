@@ -7,7 +7,7 @@ pub fn main(init: std.process.Init) !void {
     const api_key = init.environ_map.get("OPENAI_API_KEY") orelse "";
     const model = init.environ_map.get("OPENAI_MODEL") orelse "gpt-5.5";
 
-    var openai_client: nova.openai.Client = undefined;
+    var openai_client: nova.ai.openai.Client = undefined;
     try openai_client.init(gpa, init.io, .{ .base_url = base_url, .api_key = api_key, .model = model });
     defer openai_client.deinit();
 

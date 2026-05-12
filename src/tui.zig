@@ -3,7 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
-const openai_mod = @import("openai.zig");
+const openai_mod = @import("ai/openai.zig");
 const transcript_mod = @import("transcript.zig");
 
 const logo_bytes_max = 64 * 1024;

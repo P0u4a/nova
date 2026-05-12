@@ -1,5 +1,6 @@
 const std = @import("std");
-const openai = @import("openai.zig");
+
+pub const openai = @import("ai/openai.zig");
 
 pub const Config = struct {
     base_url: []const u8,

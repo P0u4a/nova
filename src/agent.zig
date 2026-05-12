@@ -272,7 +272,7 @@ test "parse bash command arguments" {
 
 test "streaming callbacks emit owned events" {
     const gpa = std.testing.allocator;
-    const openai = @import("openai.zig");
+    const openai = @import("ai/openai.zig");
     var openai_client: openai.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
     defer openai_client.deinit();

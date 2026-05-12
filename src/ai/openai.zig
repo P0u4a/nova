@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai.zig");
+const ai = @import("../ai.zig");
 
 const Scanner = std.json.Scanner;
 
@@ -10,6 +10,7 @@ const tool_call_count_max: u32 = 16;
 const stream_chunk_count_max: u32 = 100_000;
 const stream_bytes_max: u32 = 8 * 1024 * 1024;
 
+/// OpenAI-compatible AI client using the Completions API.
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -395,8 +396,6 @@ fn parseToolCallObject(
     if (has_pending_arguments) try target.arguments.appendSlice(gpa, pending.arguments.items);
     change.recordToolCall(idx);
 }
-
-
 
 fn parseToolCallFunction(
     gpa: std.mem.Allocator,
