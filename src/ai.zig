@@ -13,7 +13,7 @@ pub const ChatMessage = struct {
 };
 
 pub const ToolCall = struct {
-    index: usize,
+    index: u32,
     id: []u8,
     name: []u8,
     arguments: []u8,
@@ -46,7 +46,7 @@ pub const StreamObserver = struct {
     context: ?*anyopaque = null,
     on_content_delta: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     on_reasoning_delta: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
-    on_tool_delta: ?*const fn (?*anyopaque, usize, []const u8, []const u8) anyerror!void = null,
+    on_tool_delta: ?*const fn (?*anyopaque, u32, []const u8, []const u8) anyerror!void = null,
     on_delta_end: ?*const fn (?*anyopaque) anyerror!void = null,
 };
 
