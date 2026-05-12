@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
+const openai_mod = @import("openai.zig");
 const transcript_mod = @import("transcript.zig");
 
 const logo_bytes_max = 64 * 1024;
@@ -1074,11 +1075,12 @@ fn textRows(text: []const u8, width: u16) u16 {
 
 test "begin submit clears input and appends loading row before agent turn" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1105,11 +1107,12 @@ fn isLoadingWord(text: []const u8) bool {
 
 test "empty text deltas do not create selectable messages" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1129,11 +1132,12 @@ test "empty text deltas do not create selectable messages" {
 
 test "agent app events update transcript on the ui side" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1166,11 +1170,12 @@ test "agent app events update transcript on the ui side" {
 
 test "user can navigate away from a streaming thinking block" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1191,11 +1196,12 @@ test "user can navigate away from a streaming thinking block" {
 
 test "user can navigate away from a streaming agent message" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1216,11 +1222,12 @@ test "user can navigate away from a streaming agent message" {
 
 test "tool row persists through finish and turn completion" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1260,11 +1267,12 @@ test "tool row persists through finish and turn completion" {
 
 test "partial tool arguments do not create visible tool rows" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1294,11 +1302,12 @@ test "partial tool arguments do not create visible tool rows" {
 
 test "tool finish creates row if no complete streamed arguments appeared" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1325,11 +1334,12 @@ test "tool finish creates row if no complete streamed arguments appeared" {
 
 test "new tool response index creates a new transcript row" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1365,11 +1375,12 @@ test "new tool response index creates a new transcript row" {
 
 test "late tool finish does not move selection upward" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1406,11 +1417,12 @@ test "late tool finish does not move selection upward" {
 
 test "loading resumes after post-tool thinking delta" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1445,11 +1457,12 @@ test "loading resumes after post-tool thinking delta" {
 
 test "agent response after tool batch appears below tool rows" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
@@ -1485,11 +1498,12 @@ test "agent response after tool batch appears below tool rows" {
 
 test "content delta after tool preview does not move selection away from tool row" {
     const gpa = std.testing.allocator;
-    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1",
-        .api_key = "test",
-        .model = "test",
-    });
+    var openai_client: openai_mod.Client = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .config = .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" },
+    };
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, .{ .openai = &openai_client });
     defer agent.deinit();
 
     var app = App.init(std.testing.io, gpa, &agent);
