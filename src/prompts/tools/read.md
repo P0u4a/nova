@@ -9,15 +9,13 @@ Use `read` for inspecting files and directories. Prefer it over `cat`, `head`, `
 
 ## Selectors
 
-| `path` suffix | Behavior |
-| ------------- | -------- |
-| _(omitted)_ | Read from the start, up to {{DEFAULT_LIMIT}} lines, with content-hash anchors. |
-| `:50` | Read from line 50 onward with anchors. |
-| `:50-200` | Read lines 50-200 with anchors. |
-| `:50+150` | Read 150 lines starting at line 50 with anchors. |
-| `:20+1` | Read exactly one line with an anchor. |
-| `:raw` | Read verbatim text without anchors. |
-| `:conflicts` | Return a one-line-per-block index of every merge conflict in the file. |
+- _(no suffix)_ — read from the start, up to {{DEFAULT_LIMIT}} lines, with content-hash anchors.
+- `:50` — read from line 50 onward with anchors.
+- `:50-200` — read lines 50-200 with anchors.
+- `:50+150` — read 150 lines starting at line 50 with anchors.
+- `:20+1` — read exactly one line with an anchor.
+- `:raw` — read verbatim text without anchors.
+- `:conflicts` — return a one-line-per-block index of every merge conflict in the file.
 
 # Filesystem
 
