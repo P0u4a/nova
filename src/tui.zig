@@ -27,6 +27,7 @@ pub const App = struct {
     agent_index: ?u32 = null,
     thinking_index: ?u32 = null,
     tool_seen_in_response: bool = false,
+    awaiting_tool_call: bool = false,
     pending_redraw: bool = false,
     thread_auto_scroll: bool = true,
     tool_indexes: std.ArrayList(?u32) = .empty,
@@ -87,6 +88,7 @@ pub const App = struct {
         self.loading_frame = 0;
         self.loading_word_index = chooseLoadingWordIndex(self.io);
         self.tool_seen_in_response = false;
+        self.awaiting_tool_call = true;
         self.pending_redraw = false;
         self.thread_auto_scroll = true;
         self.tool_indexes.clearRetainingCapacity();
@@ -113,9 +115,15 @@ pub const App = struct {
     fn removeLoading(self: *App) void {
         const index = self.loading_index orelse return;
         self.loading_index = null;
-        if (index < self.thread.messages.items.len) {
-            self.thread.remove(self.gpa, index);
-        }
+        if (index >= self.thread.messages.items.len) return;
+        self.thread.remove(self.gpa, index);
+        self.adjustIndexesAfterRemove(index);
+    }
+
+    fn adjustIndexesAfterRemove(self: *App, removed_index: u32) void {
+        adjustOptionalIndex(&self.agent_index, removed_index);
+        adjustOptionalIndex(&self.thinking_index, removed_index);
+        for (self.tool_indexes.items) |*tool_index| adjustOptionalIndex(tool_index, removed_index);
     }
 
     fn advanceLoadingFrame(self: *App) void {
@@ -171,6 +179,7 @@ pub const App = struct {
                 self.agent_index = null;
                 self.thinking_index = null;
                 self.tool_seen_in_response = false;
+                self.awaiting_tool_call = false;
                 self.tool_indexes.clearRetainingCapacity();
                 try self.appendLoading();
                 _ = thinking_finished;
@@ -194,10 +203,11 @@ pub const App = struct {
     fn shouldShowResponseLoading(self: *const App) bool {
         if (!self.in_flight) return false;
         if (self.loading_index != null) return false;
-        if (self.thinking_index == null) return false;
-        if (self.agent_index != null) return false;
+        if (!self.awaiting_tool_call) return false;
         if (self.tool_seen_in_response) return false;
-        return true;
+        if (self.agent_index != null) return true;
+        if (self.thinking_index != null) return true;
+        return false;
     }
 
     fn applyContentDelta(self: *App, delta: []const u8) !void {
@@ -254,7 +264,8 @@ pub const App = struct {
         const title = try formatToolTitle(self.gpa, tool.name, tool.arguments);
         defer self.gpa.free(title);
 
-        self.removeLoading();
+        if (std.mem.eql(u8, tool.name, "bash")) self.removeLoading();
+
         var visible_change = false;
         if (self.toolThreadIndex(tool.index)) |index| {
             visible_change = !toolTitleMatchesCommand(self.thread.messages.items[index].title, title);
@@ -342,6 +353,15 @@ pub const App = struct {
         return selected == self.thread.messages.items.len - 1;
     }
 };
+
+fn adjustOptionalIndex(index: *?u32, removed_index: u32) void {
+    const current = index.* orelse return;
+    if (current == removed_index) {
+        index.* = null;
+    } else if (current > removed_index) {
+        index.* = current - 1;
+    }
+}
 
 fn toolTitleMatchesCommand(title: []const u8, command: []const u8) bool {
     const prefix = "$ ";
@@ -725,7 +745,7 @@ const MessageWidget = struct {
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
                 const body_style = toolBodyStyle(self.message);
-                drawLine(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
+                drawWrapped(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
                 if (self.message.expanded) drawWrapped(surface, self.message.body, body_style, self.selected, &row, ctx, 0, null);
             },
             .thinking => {
@@ -1055,9 +1075,9 @@ fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
             1,
         .status => 1,
         .tool => if (message.expanded)
-            1 + textRows(message.body, width)
+            textRows(message.title, width) + textRows(message.body, width)
         else
-            1,
+            textRows(message.title, width),
     };
 }
 
@@ -1278,6 +1298,96 @@ test "content deltas do not override user scroll state" {
     try std.testing.expect(!app.thread_auto_scroll);
 }
 
+test "loading does not appear during final answer after tool batch" {
+    const gpa = std.testing.allocator;
+    var openai_client: openai_mod.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("inspect");
+    _ = (try app.beginSubmit()).?;
+
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+        .index = 0,
+        .name = "bash",
+        .arguments = "{\"command\":\"pwd\"}",
+    } }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+        .index = 0,
+        .command = "pwd",
+        .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
+    } }));
+    try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
+    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
+
+    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "Final answer" }));
+    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.agent, app.thread.messages.items[2].kind);
+}
+
+test "loading appears after assistant text while waiting for tool call" {
+    const gpa = std.testing.allocator;
+    var openai_client: openai_mod.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("implement dijkstra");
+    _ = (try app.beginSubmit()).?;
+
+    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "Here's the implementation plan:" }));
+    try std.testing.expect(try app.applyAgentEvent(.delta_end));
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
+    try std.testing.expect(isLoadingWord(app.thread.messages.items[2].title));
+}
+
+test "structured tool keeps loading status while arguments stream" {
+    const gpa = std.testing.allocator;
+    var openai_client: openai_mod.Client = undefined;
+    try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
+    defer openai_client.deinit();
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .{ .openai = &openai_client });
+    defer agent.deinit();
+
+    var app = App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.input.insertSliceAtCursor("write file");
+    _ = (try app.beginSubmit()).?;
+
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
+        .index = 0,
+        .name = "write_file",
+        .arguments = "{\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");",
+    } }));
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
+
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_finished = .{
+        .index = 0,
+        .command = "write_file {\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");\"}",
+        .body = "Successfully wrote 27 bytes to main.zig\n",
+    } }));
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
+    try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
+}
+
 test "tool row persists through finish and turn completion" {
     const gpa = std.testing.allocator;
     var openai_client: openai_mod.Client = undefined;
@@ -1463,7 +1573,7 @@ test "late tool finish does not move selection upward" {
     try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
 
-test "loading resumes after post-tool thinking delta" {
+test "loading does not resume after post-tool thinking delta" {
     const gpa = std.testing.allocator;
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -1492,13 +1602,11 @@ test "loading resumes after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "checking output" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
-    try std.testing.expectEqual(@as(usize, 4), app.thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqual(.thinking, app.thread.messages.items[2].kind);
-    try std.testing.expectEqual(.status, app.thread.messages.items[3].kind);
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[2].title);
-    try std.testing.expect(isLoadingWord(app.thread.messages.items[3].title));
 }
 
 test "agent response after tool batch appears below tool rows" {
@@ -1622,6 +1730,16 @@ test "latest tall message scrolls by rows instead of message boundaries" {
     const viewport = visibleRows(thread.messages.items, thread.selected, 80, 4);
     try std.testing.expectEqual(@as(u32, 7), viewport.first);
     try std.testing.expectEqual(@as(u32, 11), threadRows(thread.messages.items, 80));
+}
+
+test "collapsed tool title wraps to visible rows" {
+    const gpa = std.testing.allocator;
+    var thread: thread_mod.Thread = .{};
+    defer thread.deinit(gpa);
+
+    const index = try thread.startTool(gpa, "edit_file {\"input\":\"a very long patch document\"}");
+    try std.testing.expect(!thread.messages.items[index].expanded);
+    try std.testing.expect(messageRows(thread.messages.items[index], 12) > 3);
 }
 
 test "collapsed tool messages render no body text" {
