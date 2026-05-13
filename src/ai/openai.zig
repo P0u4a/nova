@@ -78,7 +78,7 @@ pub const Client = struct {
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
-        try writeRequestPayload(&body_writer.writer, self.config.model, messages);
+        try writeRequestPayload(&body_writer.writer, self.config.model, messages, self.config.tools_json);
         try body_writer.end();
         try req.connection.?.flush();
 
@@ -99,8 +99,10 @@ fn writeRequestPayload(
     out: *std.Io.Writer,
     model: []const u8,
     messages: []const ai.ChatMessage,
+    tools_json: []const u8,
 ) !void {
     std.debug.assert(model.len > 0);
+    std.debug.assert(tools_json.len > 0);
 
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, out);
@@ -113,9 +115,9 @@ fn writeRequestPayload(
         try std.json.Stringify.value(message.content, .{}, out);
         try out.writeByte('}');
     }
-    try out.writeAll(
-        \\],"stream":true,"tools":[{"type":"function","function":{"name":"bash","description":"Run a bash command in the current project.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"tool_choice":"auto"}
-    );
+    try out.writeAll("],\"stream\":true,\"tools\":");
+    try out.writeAll(tools_json);
+    try out.writeAll(",\"tool_choice\":\"auto\"}");
 }
 
 const ToolCallBuilder = struct {

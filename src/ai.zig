@@ -6,6 +6,7 @@ pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
+    tools_json: []const u8 = "[]",
 };
 
 pub const ChatMessage = struct {
