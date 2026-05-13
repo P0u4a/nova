@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const bash = @import("bash.zig");
+const tools = @import("tools.zig");
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
@@ -17,6 +18,10 @@ pub const Agent = struct {
             .cwd = cwd,
             .client = client,
         };
+    }
+
+    pub fn addSystem(self: *Agent, content: []const u8) !void {
+        try self.appendMessage("system", content);
     }
 
     pub fn deinit(self: *Agent) void {
@@ -52,6 +57,7 @@ pub const Agent = struct {
             index: u32,
             command: []const u8,
             body: []const u8,
+            failed: bool = false,
         };
 
         pub fn deinit(self: *StreamEvent, gpa: std.mem.Allocator) void {
@@ -136,21 +142,48 @@ pub const Agent = struct {
             try postEvent(events, .delta_end);
         }
 
-        var result = if (try bash.commands.tryHandle(self.gpa, self.io, self.cwd, command)) |intercepted|
+        var result = if (try tools.tryHandle(self.gpa, self.io, self.cwd, command)) |intercepted|
             intercepted
         else
             try bash.run(self.gpa, self.io, self.cwd, command);
         defer result.deinit(self.gpa);
 
-        const tool_body = try std.fmt.allocPrint(
+        const failed = result.code != 0;
+        const ui_body = try formatUiBody(self.gpa, result.stdout, result.stderr, failed);
+        defer self.gpa.free(ui_body);
+
+        const model_message = try std.fmt.allocPrint(
             self.gpa,
             "$ {s}\nexit {d}\nstdout:\n{s}\nstderr:\n{s}",
             .{ command, result.code, result.stdout, result.stderr },
         );
-        defer self.gpa.free(tool_body);
+        defer self.gpa.free(model_message);
 
-        try self.postToolFinished(events, tool_index, command, tool_body);
-        try self.appendMessage("user", tool_body);
+        try self.postToolFinished(events, tool_index, command, ui_body, failed);
+        try self.appendMessage("user", model_message);
+    }
+
+    fn formatUiBody(
+        gpa: std.mem.Allocator,
+        stdout: []const u8,
+        stderr: []const u8,
+        failed: bool,
+    ) ![]u8 {
+        if (stdout.len == 0 and stderr.len == 0) {
+            return gpa.dupe(u8, if (failed) "an error occurred" else "no output");
+        }
+        var buffer: std.ArrayList(u8) = .empty;
+        errdefer buffer.deinit(gpa);
+        if (stdout.len > 0) {
+            try buffer.appendSlice(gpa, "stdout:\n");
+            try buffer.appendSlice(gpa, stdout);
+            if (buffer.items[buffer.items.len - 1] != '\n') try buffer.append(gpa, '\n');
+        }
+        if (stderr.len > 0) {
+            try buffer.appendSlice(gpa, "stderr:\n");
+            try buffer.appendSlice(gpa, stderr);
+        }
+        return buffer.toOwnedSlice(gpa);
     }
 
     const StreamContext = struct {
@@ -227,6 +260,7 @@ pub const Agent = struct {
         tool_index: u32,
         command: []const u8,
         body: []const u8,
+        failed: bool,
     ) !void {
         const owned_command = try self.gpa.dupe(u8, command);
         errdefer self.gpa.free(owned_command);
@@ -237,6 +271,7 @@ pub const Agent = struct {
                 .index = tool_index,
                 .command = owned_command,
                 .body = owned_body,
+                .failed = failed,
             },
         });
     }
