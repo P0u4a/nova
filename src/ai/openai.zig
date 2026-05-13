@@ -160,10 +160,11 @@ fn readStream(
     }
 
     var chunk_count: u32 = 0;
-    var bytes_read: u32 = 0;
-    while (try reader.takeDelimiter('\n')) |line| {
+    var bytes_read: usize = 0;
+    while (try readStreamLine(gpa, reader)) |line| {
+        defer gpa.free(line);
         chunk_count += 1;
-        bytes_read +|= @intCast(line.len);
+        bytes_read += line.len;
         if (chunk_count > stream_chunk_count_max) return error.StreamTooManyChunks;
         if (bytes_read > stream_bytes_max) return error.StreamTooLarge;
         const trimmed = std.mem.trim(u8, line, " \r");
@@ -185,6 +186,29 @@ fn readStream(
         try result.tool_calls.append(gpa, try builder.toToolCall(gpa, index));
     }
     return result;
+}
+
+fn readStreamLine(gpa: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+    var line_writer: std.Io.Writer.Allocating = .init(gpa);
+    errdefer line_writer.deinit();
+
+    _ = reader.streamDelimiterEnding(&line_writer.writer, '\n') catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.WriteFailed => return error.OutOfMemory,
+    };
+
+    const delimiter = reader.take(1) catch |err| switch (err) {
+        error.EndOfStream => {
+            if (line_writer.written().len == 0) return null;
+            const line = try line_writer.toOwnedSlice();
+            return line;
+        },
+        else => |e| return e,
+    };
+    std.debug.assert(delimiter.len == 1);
+    std.debug.assert(delimiter[0] == '\n');
+    const line = try line_writer.toOwnedSlice();
+    return line;
 }
 
 const ChunkChange = struct {
@@ -464,6 +488,23 @@ fn appendStringValue(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.Array
             else => return error.UnexpectedToken,
         }
     }
+}
+
+test "readStream accepts an SSE line larger than the transfer buffer" {
+    const gpa = std.testing.allocator;
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+
+    try stream.appendSlice(gpa, "data: {\"choices\":[{\"delta\":{\"content\":\"");
+    var index: u32 = 0;
+    while (index < transfer_buffer_bytes + 512) : (index += 1) try stream.append(gpa, 'a');
+    try stream.appendSlice(gpa, "\"}}]}\n");
+    try stream.appendSlice(gpa, "data: [DONE]\n");
+
+    var reader: std.Io.Reader = .fixed(stream.items);
+    var response = try readStream(gpa, &reader, .{});
+    defer response.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.content.len);
 }
 
 test "parse streaming tool deltas as they arrive" {
