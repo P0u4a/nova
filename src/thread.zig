@@ -20,6 +20,7 @@ pub const Message = struct {
     title: []u8,
     body: []u8,
     expanded: bool = true,
+    failed: bool = false,
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
@@ -170,11 +171,18 @@ pub const Thread = struct {
         message.title = title;
     }
 
-    pub fn finishTool(self: *Thread, gpa: std.mem.Allocator, index: u32, body: []const u8) !void {
+    pub fn finishTool(
+        self: *Thread,
+        gpa: std.mem.Allocator,
+        index: u32,
+        body: []const u8,
+        failed: bool,
+    ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
         try appendOwned(gpa, &message.body, body);
+        message.failed = failed;
     }
 
     pub fn moveSelection(self: *Thread, direction: enum { previous, next }) void {
@@ -259,7 +267,7 @@ test "consecutive tools remain separate messages" {
     defer thread.deinit(gpa);
 
     const first = try thread.startTool(gpa, "ls");
-    try thread.finishTool(gpa, first, "ls\n");
+    try thread.finishTool(gpa, first, "ls\n", false);
     const second = try thread.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);

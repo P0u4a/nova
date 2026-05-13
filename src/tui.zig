@@ -275,7 +275,7 @@ pub const App = struct {
 
         const visible_before = self.toolFinishVisibleChange(index, tool.command);
         try self.thread.updateTool(self.gpa, index, tool.command);
-        try self.thread.finishTool(self.gpa, index, tool.body);
+        try self.thread.finishTool(self.gpa, index, tool.body, tool.failed);
         self.selectGeneratedMessage(index);
         self.tool_seen_in_response = true;
         return existing_index == null or visible_before;
@@ -714,8 +714,9 @@ const MessageWidget = struct {
             .agent => drawWrapped(surface, self.message.body, .{}, self.selected, &row, ctx, 0, null),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
+                const body_style = toolBodyStyle(self.message);
                 drawLine(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
-                if (self.message.expanded) drawWrapped(surface, self.message.body, StylePalette.tool, self.selected, &row, ctx, 0, null);
+                if (self.message.expanded) drawWrapped(surface, self.message.body, body_style, self.selected, &row, ctx, 0, null);
             },
             .thinking => {
                 drawLine(surface, self.message.title, StylePalette.thinking_label, self.selected, &row, ctx, 2, StylePalette.thinking_bar);
@@ -946,6 +947,12 @@ fn visibleRows(
     return .{ .first = selected_end - height, .height = height };
 }
 
+fn toolBodyStyle(message: thread_mod.Message) vaxis.Style {
+    if (std.mem.eql(u8, message.body, "no output")) return StylePalette.thinking_body;
+    if (message.failed) return StylePalette.tool_failed;
+    return StylePalette.tool;
+}
+
 const StylePalette = struct {
     const thinking_blue = .{ 96, 165, 250 };
     const user_yellow = .{ 212, 175, 55 };
@@ -953,6 +960,7 @@ const StylePalette = struct {
     const selected: vaxis.Style = .{ .bg = .{ .rgb = .{ 38, 38, 38 } } };
     const user: vaxis.Style = .{ .fg = .{ .rgb = user_yellow }, .italic = true };
     const tool: vaxis.Style = .{ .fg = .{ .rgb = .{ 34, 197, 94 } } };
+    const tool_failed: vaxis.Style = .{ .fg = .{ .rgb = .{ 239, 68, 68 } } };
     const thinking_label: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
     const thinking_body: vaxis.Style = .{ .fg = .{ .rgb = .{ 138, 138, 138 } } };
     const thinking_bar: vaxis.Style = .{ .fg = .{ .rgb = thinking_blue } };
@@ -1612,7 +1620,7 @@ test "collapsed tool messages render no body text" {
     defer thread.deinit(gpa);
 
     const index = try thread.startTool(gpa, "printf hello");
-    try thread.finishTool(gpa, index, "stdout:\nhello\nstderr:\n");
+    try thread.finishTool(gpa, index, "stdout:\nhello\nstderr:\n", false);
 
     try std.testing.expect(!thread.messages.items[index].expanded);
     try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[index], 80));

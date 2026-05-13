@@ -3,8 +3,6 @@ const builtin = @import("builtin");
 
 const assert = std.debug.assert;
 
-pub const commands = @import("bash/commands.zig");
-
 pub const Result = struct {
     stdout: []u8,
     stderr: []u8,
