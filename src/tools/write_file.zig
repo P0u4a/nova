@@ -12,8 +12,8 @@ pub fn runTool(
     };
     defer parsed.deinit();
 
-    const path = parsed.value.object.get("path") orelse return common.fail(gpa, "write_file: missing path\n", 2);
-    const content = parsed.value.object.get("content") orelse return common.fail(gpa, "write_file: missing content\n", 2);
+    const path = parsed.value.object.get("path") orelse return common.fail(gpa, "write_file: missing required field `path`; call write_file with both `path` and `content`\n", 2);
+    const content = parsed.value.object.get("content") orelse return common.fail(gpa, "write_file: missing required field `content`; call write_file with both `path` and `content`\n", 2);
     if (path != .string) return common.fail(gpa, "write_file: path must be a string\n", 2);
     if (content != .string) return common.fail(gpa, "write_file: content must be a string\n", 2);
     return write(gpa, io, cwd, path.string, content.string);
@@ -57,5 +57,5 @@ test "write_file requires a path" {
     var output = try runTool(std.testing.allocator, std.testing.io, ".", "{\"content\":\"data\"}");
     defer output.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 2), output.code);
-    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "missing path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "missing required field `path`") != null);
 }
