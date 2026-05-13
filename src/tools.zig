@@ -3,7 +3,7 @@ const std = @import("std");
 const bash = @import("bash.zig");
 const common = @import("tools/common.zig");
 const edit_file = @import("tools/edit_file.zig");
-const read_file = @import("tools/read_file.zig");
+const read = @import("tools/read.zig");
 const search_codebase = @import("tools/search_codebase.zig");
 const write_file = @import("tools/write_file.zig");
 
@@ -18,8 +18,8 @@ pub fn run(
     arguments: []const u8,
 ) Error!bash.Result {
     if (std.mem.eql(u8, name, "bash")) return runBash(gpa, io, cwd, arguments);
-    if (std.mem.eql(u8, name, "read_file")) {
-        var output = try read_file.runTool(gpa, io, cwd, arguments);
+    if (std.mem.eql(u8, name, "read")) {
+        var output = try read.runTool(gpa, io, cwd, arguments);
         return takeResult(&output);
     }
     if (std.mem.eql(u8, name, "write_file")) {
@@ -82,8 +82,6 @@ const JsonSchemaProperty = struct {
 const JsonSchemaProperties = struct {
     command: ?JsonSchemaProperty = null,
     path: ?JsonSchemaProperty = null,
-    offset: ?JsonSchemaProperty = null,
-    limit: ?JsonSchemaProperty = null,
     content: ?JsonSchemaProperty = null,
     input: ?JsonSchemaProperty = null,
     query: ?JsonSchemaProperty = null,
@@ -107,8 +105,12 @@ const ToolDefinition = struct {
 };
 
 pub fn buildToolsJson(gpa: std.mem.Allocator) ![]u8 {
+    const read_description = try renderToolDescription(gpa, "read");
+    defer gpa.free(read_description);
     const edit_description = try renderToolDescription(gpa, "edit_file");
     defer gpa.free(edit_description);
+    const write_description = try renderToolDescription(gpa, "write_file");
+    defer gpa.free(write_description);
 
     const required_command = [_][]const u8{"command"};
     const required_path = [_][]const u8{"path"};
@@ -119,31 +121,29 @@ pub fn buildToolsJson(gpa: std.mem.Allocator) ![]u8 {
     const tool_definitions = [_]ToolDefinition{
         tool(.{
             .name = "bash",
-            .description = "Executes bash command in shell session for terminal operations like ls, cd, mkdir, mv, git and more.",
+            .description = "Executes bash command in shell session for terminal operations like mkdir, mv, git, builds, and tests. Use the read tool instead of shell commands such as cat, head, tail, less, more, ls, sed -n, or awk NR when inspecting files or directories.",
             .parameters = .{
                 .properties = .{ .command = stringProperty("Shell command to execute.") },
                 .required = &required_command,
             },
         }),
         tool(.{
-            .name = "read_file",
-            .description = "Read a file. Output lines are formatted as LINE+HASH|TEXT, for example 42ab|const x = 1;. Use the full LINE+HASH anchor exactly as shown when calling edit_file.",
+            .name = "read",
+            .description = read_description,
             .parameters = .{
                 .properties = .{
-                    .path = stringProperty("File path to read, relative to the current working directory unless absolute."),
-                    .offset = integerProperty("Optional 1-indexed first line to read. Use the next offset shown in truncation footers to continue.", 1),
-                    .limit = integerProperty("Optional maximum number of lines to return.", 0),
+                    .path = stringProperty("Required. File or directory path to read. Append selectors like :50, :50-200, :50+150, :raw, or :conflicts."),
                 },
                 .required = &required_path,
             },
         }),
         tool(.{
             .name = "write_file",
-            .description = "Write complete file content, creating parent directories as needed. Use for new files or full rewrites. Use edit_file for targeted edits to existing files.",
+            .description = write_description,
             .parameters = .{
                 .properties = .{
-                    .path = stringProperty("File path to write, relative to the current working directory unless absolute."),
-                    .content = stringProperty("Complete file content to write."),
+                    .path = stringProperty("Required. File path to create or overwrite, relative to the current working directory unless absolute."),
+                    .content = stringProperty("Required. Complete file content to write. Do not put the path here."),
                 },
                 .required = &required_path_content,
             },
@@ -152,7 +152,7 @@ pub fn buildToolsJson(gpa: std.mem.Allocator) ![]u8 {
             .name = "edit_file",
             .description = edit_description,
             .parameters = .{
-                .properties = .{ .input = stringProperty("Hashline patch document only, not an explanation. Must contain at least one @@ PATH header, followed by hashline operations using anchors from read_file.") },
+                .properties = .{ .input = stringProperty("Hashline patch document only, not an explanation. Must contain at least one @@ PATH header, followed by hashline operations using anchors from read.") },
                 .required = &required_input,
             },
         }),
@@ -191,6 +191,22 @@ fn renderToolDescription(gpa: std.mem.Allocator, comptime name: []const u8) ![]u
     return std.mem.replaceOwned(u8, gpa, prompt, "{{hsep}}", "~");
 }
 
+test "write_file schema advertises path and content as required" {
+    const json = try buildToolsJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"write_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"path\",\"content\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Always include BOTH `path` and `content`.") != null);
+}
+
+test "read schema is named read and advertises path selectors" {
+    const json = try buildToolsJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read" ++ "_file\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":50-200") != null);
+}
+
 test "tool schema is valid JSON" {
     const json = try buildToolsJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
@@ -202,7 +218,7 @@ test "tool schema is valid JSON" {
 test {
     _ = common;
     _ = edit_file;
-    _ = read_file;
+    _ = read;
     _ = search_codebase;
     _ = write_file;
     _ = @import("tools/hashline/hash.zig");
