@@ -60,11 +60,12 @@ pub fn parse(arena: std.mem.Allocator, patch: []const u8) Error![]const Edit {
     while (iter.next()) |raw_line| {
         line_no += 1;
         const line = trimTrailingCR(raw_line);
-        if (shouldSkipLine(line)) continue;
-        if (line[0] == payload_sep) return Error.PayloadOutsideOp;
+        const control_line = std.mem.trimStart(u8, line, " \t");
+        if (shouldSkipLine(control_line)) continue;
+        if (control_line[0] == payload_sep) return Error.PayloadOutsideOp;
 
-        const op_kind = classifyOp(line) orelse return Error.UnrecognizedOp;
-        const operand = std.mem.trim(u8, line[1..], " \t");
+        const op_kind = classifyOp(control_line) orelse return Error.UnrecognizedOp;
+        const operand = std.mem.trim(u8, control_line[1..], " \t");
         if (operand.len == 0) return Error.UnrecognizedOp;
 
         switch (op_kind) {
@@ -198,27 +199,68 @@ fn collectInsertPayload(
 ) Error!void {
     var collected: u32 = 0;
     while (iter.peek()) |raw_peek| {
-        const peek = trimTrailingCR(raw_peek);
+        const peek = std.mem.trimStart(u8, trimTrailingCR(raw_peek), " \t");
         if (peek.len == 0 or peek[0] != payload_sep) break;
         _ = iter.next();
         line_no.* += 1;
-        const text = peek[1..];
-        try edits.append(arena, .{ .insert = .{
-            .cursor = cursor,
-            .text = text,
-            .source_line = op_source_line,
-        } });
+        if (peek.len == 1) {
+            const block_count = try collectBlockPayload(arena, edits, iter, line_no, cursor, op_source_line);
+            if (block_count > 0) {
+                collected += block_count;
+                continue;
+            }
+        }
+        try appendInsert(arena, edits, cursor, peek[1..], op_source_line);
         collected += 1;
     }
     if (collected == 0 and require_payload) return Error.MissingPayload;
     if (collected == 0) {
         // `= A..B` with no payload blanks the range to a single empty line.
-        try edits.append(arena, .{ .insert = .{
-            .cursor = cursor,
-            .text = "",
-            .source_line = op_source_line,
-        } });
+        try appendInsert(arena, edits, cursor, "", op_source_line);
     }
+}
+
+fn collectBlockPayload(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(Edit),
+    iter: *std.mem.SplitIterator(u8, .scalar),
+    line_no: *u32,
+    cursor: Cursor,
+    op_source_line: u32,
+) Error!u32 {
+    var collected: u32 = 0;
+    while (iter.peek()) |raw_peek| {
+        const raw_line = trimTrailingCR(raw_peek);
+        const control_line = std.mem.trimStart(u8, raw_line, " \t");
+        if (isBlockPayloadTerminator(control_line)) break;
+        _ = iter.next();
+        line_no.* += 1;
+        try appendInsert(arena, edits, cursor, raw_line, op_source_line);
+        collected += 1;
+    }
+    return collected;
+}
+
+fn isBlockPayloadTerminator(line: []const u8) bool {
+    if (line.len == 0) return false;
+    if (line[0] == payload_sep) return true;
+    if (classifyOp(line) != null) return true;
+    if (shouldSkipLine(line)) return true;
+    return false;
+}
+
+fn appendInsert(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(Edit),
+    cursor: Cursor,
+    text: []const u8,
+    op_source_line: u32,
+) Error!void {
+    try edits.append(arena, .{ .insert = .{
+        .cursor = cursor,
+        .text = text,
+        .source_line = op_source_line,
+    } });
 }
 
 test "parses a single insert-before with payload" {
@@ -243,6 +285,36 @@ test "parses a delete range as one anchor per line" {
     try std.testing.expectEqual(@as(u32, 11), edits[1].delete.anchor.line);
     try std.testing.expectEqual(@as(u32, 12), edits[2].delete.anchor.line);
     try std.testing.expectEqualSlices(u8, &range_interior_hash, &edits[1].delete.anchor.hash);
+}
+
+test "parses bare separator as block payload marker" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const edits = try parse(arena,
+        \\= 30sm..30sm
+        \\~
+        \\## Heading
+        \\Body text
+        \\*** End Patch
+    );
+    try std.testing.expectEqual(@as(usize, 3), edits.len);
+    try std.testing.expectEqualStrings("## Heading", edits[0].insert.text);
+    try std.testing.expectEqualStrings("Body text", edits[1].insert.text);
+    try std.testing.expectEqual(@as(u32, 30), edits[2].delete.anchor.line);
+}
+
+test "parses indented operations" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const edits = try parse(arena,
+        \\  = 5sr..5sr
+        \\  ~replacement
+    );
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqualStrings("replacement", edits[0].insert.text);
+    try std.testing.expectEqual(@as(u32, 5), edits[1].delete.anchor.line);
 }
 
 test "replace becomes insert-before plus deletes" {

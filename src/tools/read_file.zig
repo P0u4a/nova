@@ -2,22 +2,6 @@ const std = @import("std");
 const common = @import("common.zig");
 const hashline = @import("hashline/hash.zig");
 
-pub const name = "read-file";
-
-pub const help_text =
-    \\Usage: read-file [--offset N] [--limit N] PATH
-    \\
-    \\Prints file content. Output is truncated to 2000
-    \\lines or 50KB; the truncation footer shows the next --offset to
-    \\continue.
-    \\Each line is prefixed with `LINE+HASH|TEXT` anchors that edit-file consumes
-    \\Options:
-    \\  --offset N   start at line N (1-indexed, default 1)
-    \\  --limit N    print at most N lines (otherwise truncate at the
-    \\               2000-line / 50KB cap)
-    \\  --help       show this message
-;
-
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_output_lines: u32 = 2000;
 const max_output_bytes: usize = 50 * 1024;
@@ -28,64 +12,62 @@ const Args = struct {
     limit: ?u32 = null,
 };
 
-pub fn run(
+pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    argv: []const []const u8,
-    stdin: []const u8,
+    arguments: []const u8,
 ) common.Error!common.Output {
-    _ = stdin;
-    if (common.wantsHelp(argv)) return common.helpOutput(gpa, help_text);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, arguments, .{}) catch {
+        return common.fail(gpa, "read_file: invalid JSON arguments\n", 2);
+    };
+    defer parsed.deinit();
 
-    const args = parseArgs(argv) catch |err| return parseError(gpa, err);
+    const args = parseToolArgs(gpa, parsed.value) catch |err| return parseToolError(gpa, err);
+    return read(gpa, io, cwd, args);
+}
+
+const ParseToolError = error{ MissingPath, BadPath, BadOffset, BadLimit, OutOfMemory };
+
+fn parseToolArgs(gpa: std.mem.Allocator, value: std.json.Value) ParseToolError!Args {
+    _ = gpa;
+    const path = value.object.get("path") orelse return ParseToolError.MissingPath;
+    if (path != .string) return ParseToolError.BadPath;
+    var args: Args = .{ .path = path.string };
+    if (value.object.get("offset")) |offset| {
+        if (offset != .integer) return ParseToolError.BadOffset;
+        if (offset.integer < 1) return ParseToolError.BadOffset;
+        args.offset = std.math.cast(u32, offset.integer) orelse return ParseToolError.BadOffset;
+    }
+    if (value.object.get("limit")) |limit| {
+        if (limit != .integer) return ParseToolError.BadLimit;
+        if (limit.integer < 0) return ParseToolError.BadLimit;
+        args.limit = std.math.cast(u32, limit.integer) orelse return ParseToolError.BadLimit;
+    }
+    return args;
+}
+
+fn parseToolError(gpa: std.mem.Allocator, err: ParseToolError) common.Error!common.Output {
+    const message = switch (err) {
+        ParseToolError.MissingPath => "read_file: missing path\n",
+        ParseToolError.BadPath => "read_file: path must be a string\n",
+        ParseToolError.BadOffset => "read_file: offset must be a positive integer\n",
+        ParseToolError.BadLimit => "read_file: limit must be a non-negative integer\n",
+        ParseToolError.OutOfMemory => return error.OutOfMemory,
+    };
+    return common.fail(gpa, message, 2);
+}
+
+fn read(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, args: Args) common.Error!common.Output {
     const absolute = joinPath(gpa, cwd, args.path) catch |err| return mapAllocError(err);
     defer gpa.free(absolute);
 
     const bytes = readFileBytes(gpa, io, absolute) catch |err| {
-        return common.failFmt(gpa, 1, "read-file: {s}: {s}\n", .{ args.path, @errorName(err) });
+        return common.failFmt(gpa, 1, "read_file: {s}: {s}\n", .{ args.path, @errorName(err) });
     };
     defer gpa.free(bytes);
 
     return formatOutput(gpa, args, bytes);
-}
-
-const ParseError = error{ MissingPath, BadOffset, BadLimit, UnknownFlag };
-
-fn parseArgs(argv: []const []const u8) ParseError!Args {
-    var args: Args = .{ .path = "" };
-    var index: usize = 0;
-    while (index < argv.len) : (index += 1) {
-        const arg = argv[index];
-        if (std.mem.eql(u8, arg, "--offset")) {
-            if (index + 1 >= argv.len) return ParseError.BadOffset;
-            args.offset = std.fmt.parseInt(u32, argv[index + 1], 10) catch return ParseError.BadOffset;
-            if (args.offset == 0) return ParseError.BadOffset;
-            index += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--limit")) {
-            if (index + 1 >= argv.len) return ParseError.BadLimit;
-            args.limit = std.fmt.parseInt(u32, argv[index + 1], 10) catch return ParseError.BadLimit;
-            index += 1;
-            continue;
-        }
-        if (arg.len > 0 and arg[0] == '-') return ParseError.UnknownFlag;
-        if (args.path.len > 0) continue;
-        args.path = arg;
-    }
-    if (args.path.len == 0) return ParseError.MissingPath;
-    return args;
-}
-
-fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Output {
-    const message = switch (err) {
-        ParseError.MissingPath => "read-file: missing PATH argument\n",
-        ParseError.BadOffset => "read-file: --offset must be a positive integer\n",
-        ParseError.BadLimit => "read-file: --limit must be a non-negative integer\n",
-        ParseError.UnknownFlag => "read-file: unknown flag (try --help)\n",
-    };
-    return common.fail(gpa, message, 2);
 }
 
 fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8) ![]u8 {
@@ -105,8 +87,8 @@ fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
 
 fn mapAllocError(err: anyerror) common.Error {
     return switch (err) {
-        error.OutOfMemory => common.Error.OutOfMemory,
-        else => common.Error.Unexpected,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Unexpected,
     };
 }
 
@@ -118,7 +100,7 @@ fn formatOutput(gpa: std.mem.Allocator, args: Args, bytes: []const u8) common.Er
     const total_lines: u32 = @intCast(lines.items.len);
 
     if (args.offset > total_lines) {
-        return common.failFmt(gpa, 2, "read-file: --offset {d} is past end of file ({d} lines)\n", .{ args.offset, total_lines });
+        return common.failFmt(gpa, 2, "read_file: offset {d} is past end of file ({d} lines)\n", .{ args.offset, total_lines });
     }
 
     var buffer: std.ArrayList(u8) = .empty;
@@ -140,8 +122,8 @@ fn formatOutput(gpa: std.mem.Allocator, args: Args, bytes: []const u8) common.Er
 
 fn chooseStop(args: Args, total_lines: u32) u32 {
     if (args.limit) |limit| {
+        if (limit == 0) return args.offset - 1;
         const candidate = args.offset + limit - 1;
-        if (limit == 0) return args.offset - 1; // empty output
         return @min(candidate, total_lines);
     }
     return total_lines;
@@ -151,7 +133,7 @@ fn estimateLineCost(line_number: u32, line: []const u8) usize {
     var digits: usize = 1;
     var n = line_number;
     while (n >= 10) : (n /= 10) digits += 1;
-    return digits + 2 + 1 + line.len + 1; // <num><hash>|<text>\n
+    return digits + 2 + 1 + line.len + 1;
 }
 
 fn appendFooter(
@@ -162,41 +144,21 @@ fn appendFooter(
     next_line: u32,
     emitted: u32,
 ) common.Error!void {
-    if (next_line > total_lines) return; // showed everything we asked for
+    if (next_line > total_lines) return;
     if (args.limit) |_| {
-        // User-set limit reached but file has more.
-        try buffer.print(gpa, "\n\n[Showing lines {d}-{d} of {d}. Use --offset {d} to continue.]", .{
+        try buffer.print(gpa, "\n\n[Showing lines {d}-{d} of {d}. Use offset {d} to continue.]", .{
             args.offset, args.offset + emitted - 1, total_lines, next_line,
         });
         return;
     }
-    try buffer.print(gpa, "\n\n[Showing lines {d}-{d} of {d} (truncated at {d} lines / {d}KB). Use --offset {d} to continue.]", .{
+    try buffer.print(gpa, "\n\n[Showing lines {d}-{d} of {d} (truncated at {d} lines / {d}KB). Use offset {d} to continue.]", .{
         args.offset, args.offset + emitted - 1, total_lines, max_output_lines, max_output_bytes / 1024, next_line,
     });
 }
 
-test "read-file --help returns the help text" {
-    const gpa = std.testing.allocator;
-    var argv = [_][]const u8{"--help"};
-    var output = try run(gpa, std.testing.io, ".", &argv, "");
-    defer output.deinit(gpa);
-    try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "read-file") != null);
-}
-
-test "read-file missing path is a usage error" {
-    const gpa = std.testing.allocator;
-    var argv = [_][]const u8{};
-    var output = try run(gpa, std.testing.io, ".", &argv, "");
-    defer output.deinit(gpa);
+test "read_file missing path is a usage error" {
+    var output = try runTool(std.testing.allocator, std.testing.io, ".", "{}");
+    defer output.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 2), output.code);
-    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "missing PATH") != null);
-}
-
-test "parseArgs reads offset and limit" {
-    var argv = [_][]const u8{ "--offset", "5", "--limit", "20", "foo.zig" };
-    const parsed = try parseArgs(&argv);
-    try std.testing.expectEqual(@as(u32, 5), parsed.offset);
-    try std.testing.expectEqual(@as(?u32, 20), parsed.limit);
-    try std.testing.expectEqualStrings("foo.zig", parsed.path);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "missing path") != null);
 }

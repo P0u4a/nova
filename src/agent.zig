@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
-const bash = @import("bash.zig");
 const tools = @import("tools.zig");
 
 pub const Agent = struct {
@@ -114,8 +113,7 @@ pub const Agent = struct {
         events: Events,
     ) !void {
         for (tool_calls) |tool_call| {
-            if (!std.mem.eql(u8, tool_call.name, "bash")) continue;
-            try self.runBashTool(
+            try self.runToolCall(
                 tool_call.index,
                 tool_call.name,
                 tool_call.arguments,
@@ -126,7 +124,7 @@ pub const Agent = struct {
         try postEvent(events, .tool_batch_finished);
     }
 
-    fn runBashTool(
+    fn runToolCall(
         self: *Agent,
         tool_index: u32,
         name: []const u8,
@@ -134,19 +132,16 @@ pub const Agent = struct {
         streamed_preview: bool,
         events: Events,
     ) !void {
-        const command = try parseCommand(self.gpa, arguments);
-        defer self.gpa.free(command);
-
         if (!streamed_preview) {
             try self.postToolDelta(events, tool_index, name, arguments);
             try postEvent(events, .delta_end);
         }
 
-        var result = if (try tools.tryHandle(self.gpa, self.io, self.cwd, command)) |intercepted|
-            intercepted
-        else
-            try bash.run(self.gpa, self.io, self.cwd, command);
+        var result = try tools.run(self.gpa, self.io, self.cwd, name, arguments);
         defer result.deinit(self.gpa);
+
+        const title = try formatToolTitle(self.gpa, name, arguments);
+        defer self.gpa.free(title);
 
         const failed = result.code != 0;
         const ui_body = try formatUiBody(self.gpa, result.stdout, result.stderr, failed);
@@ -154,13 +149,20 @@ pub const Agent = struct {
 
         const model_message = try std.fmt.allocPrint(
             self.gpa,
-            "$ {s}\nexit {d}\nstdout:\n{s}\nstderr:\n{s}",
-            .{ command, result.code, result.stdout, result.stderr },
+            "tool {s}\nexit {d}\nstdout:\n{s}\nstderr:\n{s}",
+            .{ title, result.code, result.stdout, result.stderr },
         );
         defer self.gpa.free(model_message);
 
-        try self.postToolFinished(events, tool_index, command, ui_body, failed);
+        try self.postToolFinished(events, tool_index, title, ui_body, failed);
         try self.appendMessage("user", model_message);
+    }
+
+    fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
+        if (std.mem.eql(u8, name, "bash")) {
+            if (parseCommand(gpa, arguments)) |command| return command else |_| {}
+        }
+        return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
     }
 
     fn formatUiBody(
@@ -224,7 +226,6 @@ pub const Agent = struct {
 
     fn onToolDelta(context: ?*anyopaque, tool_index: u32, name: []const u8, arguments: []const u8) !void {
         const concrete: *StreamContext = @ptrCast(@alignCast(context.?));
-        if (!std.mem.eql(u8, name, "bash")) return;
         try concrete.markToolDeltaSeen(tool_index);
         try concrete.agent.postToolDelta(concrete.events, tool_index, name, arguments);
     }

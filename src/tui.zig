@@ -247,22 +247,32 @@ pub const App = struct {
     }
 
     fn applyToolDelta(self: *App, tool: agent_mod.Agent.StreamEvent.ToolDelta) !bool {
-        if (!std.mem.eql(u8, tool.name, "bash")) return false;
-        const command = agent_mod.parseCommand(self.gpa, tool.arguments) catch return false;
-        defer self.gpa.free(command);
+        if (std.mem.eql(u8, tool.name, "bash")) {
+            const command = agent_mod.parseCommand(self.gpa, tool.arguments) catch return false;
+            self.gpa.free(command);
+        }
+        const title = try formatToolTitle(self.gpa, tool.name, tool.arguments);
+        defer self.gpa.free(title);
 
         self.removeLoading();
         var visible_change = false;
         if (self.toolThreadIndex(tool.index)) |index| {
-            visible_change = !toolTitleMatchesCommand(self.thread.messages.items[index].title, command);
-            try self.thread.updateTool(self.gpa, index, command);
+            visible_change = !toolTitleMatchesCommand(self.thread.messages.items[index].title, title);
+            try self.thread.updateTool(self.gpa, index, title);
         } else {
-            const index = try self.thread.startTool(self.gpa, command);
+            const index = try self.thread.startTool(self.gpa, title);
             try self.putToolThreadIndex(tool.index, index);
             visible_change = true;
         }
         self.tool_seen_in_response = true;
         return visible_change;
+    }
+
+    fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
+        if (std.mem.eql(u8, name, "bash")) {
+            if (agent_mod.parseCommand(gpa, arguments)) |command| return command else |_| {}
+        }
+        return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
     }
 
     fn applyToolFinished(self: *App, tool: agent_mod.Agent.StreamEvent.ToolFinished) !bool {

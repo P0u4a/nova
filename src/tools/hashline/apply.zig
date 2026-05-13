@@ -64,18 +64,13 @@ fn collectMismatches(
     var mismatches: std.ArrayList(Mismatch) = .empty;
     errdefer mismatches.deinit(gpa);
     for (edits) |edit| {
-        const anchors = anchorsOf(edit);
-        for (anchors) |anchor| {
-            if (anchor.line == 0) return Error.LineOutOfRange;
-            if (anchor.line > file_lines.len) return Error.LineOutOfRange;
-            if (std.mem.eql(u8, &anchor.hash, &parse.range_interior_hash)) continue;
-            const actual = hash_mod.computeLineHash(anchor.line, file_lines[anchor.line - 1]);
-            if (actual[0] == anchor.hash[0] and actual[1] == anchor.hash[1]) continue;
-            try mismatches.append(gpa, .{
-                .line = anchor.line,
-                .expected = anchor.hash,
-                .actual = .{ actual[0], actual[1] },
-            });
+        switch (edit) {
+            .delete => |d| try collectAnchorMismatch(gpa, &mismatches, d.anchor, file_lines, false),
+            .insert => |i| switch (i.cursor) {
+                .bof, .eof => {},
+                .before_anchor => |a| try collectAnchorMismatch(gpa, &mismatches, a, file_lines, true),
+                .after_anchor => |a| try collectAnchorMismatch(gpa, &mismatches, a, file_lines, true),
+            },
         }
     }
     if (mismatches.items.len == 0) {
@@ -85,15 +80,38 @@ fn collectMismatches(
     return try mismatches.toOwnedSlice(gpa);
 }
 
-fn anchorsOf(edit: parse.Edit) []const parse.Anchor {
-    return switch (edit) {
-        .delete => |d| (&[1]parse.Anchor{d.anchor})[0..1],
-        .insert => |i| switch (i.cursor) {
-            .bof, .eof => &[_]parse.Anchor{},
-            .before_anchor => |a| (&[1]parse.Anchor{a})[0..1],
-            .after_anchor => |a| (&[1]parse.Anchor{a})[0..1],
-        },
-    };
+fn collectAnchorMismatch(
+    gpa: std.mem.Allocator,
+    mismatches: *std.ArrayList(Mismatch),
+    anchor: parse.Anchor,
+    file_lines: []const []const u8,
+    allow_virtual_trailing_empty: bool,
+) Error!void {
+    if (anchor.line == 0) return Error.LineOutOfRange;
+    if (anchor.line > file_lines.len) {
+        if (allow_virtual_trailing_empty) {
+            if (isVirtualTrailingEmptyAnchor(anchor, file_lines.len)) return;
+        }
+        return Error.LineOutOfRange;
+    }
+    if (std.mem.eql(u8, &anchor.hash, &parse.range_interior_hash)) return;
+    const actual = hash_mod.computeLineHash(anchor.line, file_lines[anchor.line - 1]);
+    if (actual[0] == anchor.hash[0]) {
+        if (actual[1] == anchor.hash[1]) return;
+    }
+    try mismatches.append(gpa, .{
+        .line = anchor.line,
+        .expected = anchor.hash,
+        .actual = .{ actual[0], actual[1] },
+    });
+}
+
+fn isVirtualTrailingEmptyAnchor(anchor: parse.Anchor, file_line_count: usize) bool {
+    if (anchor.line != file_line_count + 1) return false;
+    const expected = hash_mod.computeLineHash(anchor.line, "");
+    if (expected[0] != anchor.hash[0]) return false;
+    if (expected[1] != anchor.hash[1]) return false;
+    return true;
 }
 
 const Bucket = struct {
@@ -143,7 +161,13 @@ fn routeEdit(
         .insert => |ins| switch (ins.cursor) {
             .bof => try bof.append(gpa, ins.text),
             .eof => try eof.append(gpa, ins.text),
-            .before_anchor => |a| try appendToBucket(gpa, by_line, a.line, ins.text),
+            .before_anchor => |a| {
+                if (isVirtualTrailingEmptyAnchor(a, file_line_count)) {
+                    try eof.append(gpa, ins.text);
+                } else {
+                    try appendToBucket(gpa, by_line, a.line, ins.text);
+                }
+            },
             .after_anchor => |a| {
                 if (a.line >= file_line_count) {
                     try eof.append(gpa, ins.text);
@@ -349,6 +373,24 @@ test "apply rejects when a hash no longer matches" {
             try std.testing.expectEqual(@as(u32, 2), mismatches[0].line);
             try std.testing.expectEqualSlices(u8, "zz", &mismatches[0].expected);
         },
+    }
+}
+
+test "apply appends after a virtual trailing empty anchor" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const virtual_hash = hash_mod.computeLineHash(2, "");
+    const patch = try std.fmt.allocPrint(arena, "+ 2{s}\n~tail\n", .{virtual_hash});
+    const edits = try parseFromOne(arena, patch);
+    const outcome = try apply(gpa, "only", edits);
+    switch (outcome) {
+        .applied => |a| {
+            defer gpa.free(a.content);
+            try std.testing.expectEqualStrings("only\ntail", a.content);
+        },
+        .rejected => return error.UnexpectedRejection,
     }
 }
 
