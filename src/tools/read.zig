@@ -111,6 +111,7 @@ fn read(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, args: Args) common.
     };
 }
 
+// TODO: Investigate io_uring here
 fn readDirectory(gpa: std.mem.Allocator, io: std.Io, display_path: []const u8, absolute: []const u8) !common.Output {
     var dir = try std.Io.Dir.openDirAbsolute(io, absolute, .{ .iterate = true });
     defer dir.close(io);
