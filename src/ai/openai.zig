@@ -101,6 +101,36 @@ pub const Client = struct {
     }
 };
 
+fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+    try out.writeAll("{\"role\":");
+    try std.json.Stringify.value(message.role, .{}, out);
+    try out.writeAll(",\"content\":");
+    try std.json.Stringify.value(message.content, .{}, out);
+    if (message.tool_call_id) |tool_call_id| {
+        try out.writeAll(",\"tool_call_id\":");
+        try std.json.Stringify.value(tool_call_id, .{}, out);
+    }
+    if (message.tool_calls.len > 0) {
+        try out.writeAll(",\"tool_calls\":[");
+        for (message.tool_calls, 0..) |tool_call, index| {
+            if (index > 0) try out.writeByte(',');
+            try writeStoredToolCall(out, tool_call);
+        }
+        try out.writeByte(']');
+    }
+    try out.writeByte('}');
+}
+
+fn writeStoredToolCall(out: *std.Io.Writer, tool_call: ai.StoredToolCall) !void {
+    try out.writeAll("{\"id\":");
+    try std.json.Stringify.value(tool_call.id, .{}, out);
+    try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+    try std.json.Stringify.value(tool_call.name, .{}, out);
+    try out.writeAll(",\"arguments\":");
+    try std.json.Stringify.value(tool_call.arguments, .{}, out);
+    try out.writeAll("}}");
+}
+
 fn writeRequestPayload(
     out: *std.Io.Writer,
     model: []const u8,
@@ -116,11 +146,7 @@ fn writeRequestPayload(
     try out.writeAll(",\"messages\":[");
     for (messages, 0..) |message, index| {
         if (index > 0) try out.writeByte(',');
-        try out.writeAll("{\"role\":");
-        try std.json.Stringify.value(message.role, .{}, out);
-        try out.writeAll(",\"content\":");
-        try std.json.Stringify.value(message.content, .{}, out);
-        try out.writeByte('}');
+        try writeMessage(out, message);
     }
     try out.writeAll("],\"stream\":true,\"tools\":");
     try out.writeAll(tools_json);

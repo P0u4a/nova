@@ -4,12 +4,18 @@ const ai = @import("ai.zig");
 const hashline = @import("tools/hashline/hash.zig");
 const tools = @import("tools.zig");
 
+const assert = std.debug.assert;
+
 pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     client: ai.AIClient,
     messages: std.ArrayList(ai.ChatMessage) = .empty,
+    /// Monotonic counter for fallback tool_call ids when the inference
+    /// server omits them. The canonical OpenAI protocol requires ids that
+    /// link assistant tool_calls to their `tool` result messages.
+    tool_call_seq: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.AIClient) Agent {
         return .{
@@ -28,6 +34,14 @@ pub const Agent = struct {
         for (self.messages.items) |message| {
             self.gpa.free(message.role);
             self.gpa.free(message.content);
+            if (message.tool_call_id) |id| self.gpa.free(id);
+            if (message.tool_calls.len > 0) {
+                for (message.tool_calls) |tool_call| {
+                    var owned = tool_call;
+                    owned.deinit(self.gpa);
+                }
+                self.gpa.free(message.tool_calls);
+            }
         }
         self.messages.deinit(self.gpa);
         self.* = undefined;
@@ -58,6 +72,15 @@ pub const Agent = struct {
             command: []const u8,
             body: []const u8,
             failed: bool = false,
+            /// True when the thread message should be rendered with its body
+            /// visible immediately, instead of collapsed behind its title.
+            /// Set by `tools.defaultExpanded(name)` in `runToolCall`.
+            expanded: bool = false,
+            /// How the TUI should colour the body. Set by `tools.renderMode`.
+            render: tools.Render = .plain,
+            /// Owned stderr text rendered in red beneath the body, or null
+            /// when the tool produced no stderr output.
+            stderr_body: ?[]const u8 = null,
         };
 
         pub fn deinit(self: *StreamEvent, gpa: std.mem.Allocator) void {
@@ -70,6 +93,7 @@ pub const Agent = struct {
                 .tool_finished => |tool| {
                     gpa.free(tool.command);
                     gpa.free(tool.body);
+                    if (tool.stderr_body) |stderr| gpa.free(stderr);
                 },
                 .delta_end, .tool_batch_finished, .turn_finished => {},
             }
@@ -100,22 +124,60 @@ pub const Agent = struct {
             });
             defer response.deinit(self.gpa);
 
-            if (response.content.len > 0) try self.appendMessage("assistant", response.content);
+            var resolved_ids: std.ArrayList([]u8) = .empty;
+            defer {
+                for (resolved_ids.items) |id| self.gpa.free(id);
+                resolved_ids.deinit(self.gpa);
+            }
+            try self.resolveToolCallIds(&resolved_ids, response.tool_calls.items);
+
+            if (response.tool_calls.items.len > 0) {
+                try self.appendAssistantTurn(response.content, response.tool_calls.items, resolved_ids.items);
+            } else if (response.content.len > 0) {
+                try self.appendMessage("assistant", response.content);
+            }
+
             if (response.tool_calls.items.len == 0) return;
-            try self.runTools(response.tool_calls.items, &stream_context, events);
+            try self.runTools(response.tool_calls.items, resolved_ids.items, &stream_context, events);
         }
         return error.ToolCallLimit;
+    }
+
+    /// Fill `out` with one owned id per tool_call. When the inference server
+    /// returned an id we dupe it; when it didn't we mint a fallback so the
+    /// assistant message and the tool result message agree on the linkage.
+    fn resolveToolCallIds(
+        self: *Agent,
+        out: *std.ArrayList([]u8),
+        tool_calls: []const ai.ToolCall,
+    ) !void {
+        for (tool_calls) |tool_call| {
+            const owned = if (tool_call.id.len > 0)
+                try self.gpa.dupe(u8, tool_call.id)
+            else
+                try self.nextToolCallId();
+            try out.append(self.gpa, owned);
+        }
+    }
+
+    fn nextToolCallId(self: *Agent) ![]u8 {
+        const seq = self.tool_call_seq;
+        self.tool_call_seq += 1;
+        return std.fmt.allocPrint(self.gpa, "call_{d}", .{seq});
     }
 
     fn runTools(
         self: *Agent,
         tool_calls: []const ai.ToolCall,
+        tool_call_ids: []const []u8,
         stream_context: *const StreamContext,
         events: Events,
     ) !void {
-        for (tool_calls) |tool_call| {
+        assert(tool_calls.len == tool_call_ids.len);
+        for (tool_calls, tool_call_ids) |tool_call, tool_call_id| {
             try self.runToolCall(
                 tool_call.index,
+                tool_call_id,
                 tool_call.name,
                 tool_call.arguments,
                 stream_context.toolDeltaSeen(tool_call.index),
@@ -128,11 +190,13 @@ pub const Agent = struct {
     fn runToolCall(
         self: *Agent,
         tool_index: u32,
+        tool_call_id: []const u8,
         name: []const u8,
         arguments: []const u8,
         streamed_preview: bool,
         events: Events,
     ) !void {
+        assert(tool_call_id.len > 0);
         if (!streamed_preview) {
             try self.postToolDelta(events, tool_index, name, arguments);
             try postEvent(events, .delta_end);
@@ -145,49 +209,72 @@ pub const Agent = struct {
         defer self.gpa.free(title);
 
         const failed = result.code != 0;
-        const ui_body = try formatUiBody(self.gpa, result.stdout, result.stderr, failed);
-        defer self.gpa.free(ui_body);
+        const expanded = tools.defaultExpanded(name);
+        const render = tools.renderMode(name);
 
-        const model_message = try std.fmt.allocPrint(
-            self.gpa,
-            "tool {s}\nexit {d}\nstdout:\n{s}\nstderr:\n{s}",
-            .{ title, result.code, result.stdout, result.stderr },
-        );
-        defer self.gpa.free(model_message);
+        var ui = try resolveUiParts(self.gpa, result);
+        defer ui.deinit(self.gpa);
 
-        try self.postToolFinished(events, tool_index, title, ui_body, failed);
-        try self.appendMessage("user", model_message);
+        const tool_result_content = try formatToolResultContent(self.gpa, result);
+        defer self.gpa.free(tool_result_content);
+
+        try self.postToolFinished(events, tool_index, title, ui.body, ui.stderr, failed, expanded, render);
+        try self.appendToolResult(tool_call_id, tool_result_content);
     }
 
-    fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
-        if (std.mem.eql(u8, name, "bash")) {
-            if (parseCommand(gpa, arguments)) |command| return command else |_| {}
+    const UiParts = struct {
+        body: []u8,
+        stderr: ?[]u8,
+
+        fn deinit(self: *UiParts, gpa: std.mem.Allocator) void {
+            gpa.free(self.body);
+            if (self.stderr) |stderr| gpa.free(stderr);
+            self.* = undefined;
         }
-        return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
+    };
+
+    /// The string we send back to the model as a tool result. Rule:
+    /// stdout if non-empty, else stderr if non-empty, else the literal
+    /// "empty". When both are non-empty (typical for bash commands that
+    /// write to both streams) we concatenate them so we don't drop signal.
+    fn formatToolResultContent(gpa: std.mem.Allocator, result: tools.Result) ![]u8 {
+        if (result.stdout.len > 0 and result.stderr.len > 0) {
+            return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ result.stdout, result.stderr });
+        }
+        if (result.stdout.len > 0) return gpa.dupe(u8, result.stdout);
+        if (result.stderr.len > 0) return gpa.dupe(u8, result.stderr);
+        return gpa.dupe(u8, "empty");
     }
 
-    fn formatUiBody(
-        gpa: std.mem.Allocator,
-        stdout: []const u8,
-        stderr: []const u8,
-        failed: bool,
-    ) ![]u8 {
-        if (stdout.len == 0 and stderr.len == 0) {
-            return gpa.dupe(u8, if (failed) "an error occurred" else "no output");
+    /// Picks the body and stderr shown in the TUI. The body carries the
+    /// tool's "main" output (display body when the tool emitted one, else
+    /// the stdout text), styled per the tool's render mode. Stderr is held
+    /// separately so the TUI can paint it red beneath the body.
+    fn resolveUiParts(gpa: std.mem.Allocator, result: tools.Result) !UiParts {
+        const body = try resolveUiBodyText(gpa, result);
+        errdefer gpa.free(body);
+        const stderr = try resolveUiStderr(gpa, result.stderr);
+        return .{ .body = body, .stderr = stderr };
+    }
+
+    fn resolveUiBodyText(gpa: std.mem.Allocator, result: tools.Result) ![]u8 {
+        if (result.display) |display| {
+            assert(display.len > 0);
+            return gpa.dupe(u8, display);
+        }
+        if (result.stdout.len == 0) {
+            if (result.stderr.len > 0) return gpa.alloc(u8, 0);
+            return gpa.dupe(u8, "no output");
         }
         var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(gpa);
-        if (stdout.len > 0) {
-            try buffer.appendSlice(gpa, "stdout:\n");
-            // TODO: Extract this to a generic tool output formatter.
-            try hashline.appendStripped(gpa, &buffer, stdout);
-            if (buffer.items[buffer.items.len - 1] != '\n') try buffer.append(gpa, '\n');
-        }
-        if (stderr.len > 0) {
-            try buffer.appendSlice(gpa, "stderr:\n");
-            try buffer.appendSlice(gpa, stderr);
-        }
+        try hashline.appendStripped(gpa, &buffer, result.stdout);
         return buffer.toOwnedSlice(gpa);
+    }
+
+    fn resolveUiStderr(gpa: std.mem.Allocator, stderr: []const u8) !?[]u8 {
+        if (stderr.len == 0) return null;
+        return try gpa.dupe(u8, stderr);
     }
 
     const StreamContext = struct {
@@ -263,18 +350,29 @@ pub const Agent = struct {
         tool_index: u32,
         command: []const u8,
         body: []const u8,
+        stderr_body: ?[]const u8,
         failed: bool,
+        expanded: bool,
+        render: tools.Render,
     ) !void {
         const owned_command = try self.gpa.dupe(u8, command);
         errdefer self.gpa.free(owned_command);
         const owned_body = try self.gpa.dupe(u8, body);
         errdefer self.gpa.free(owned_body);
+        const owned_stderr: ?[]u8 = if (stderr_body) |stderr|
+            try self.gpa.dupe(u8, stderr)
+        else
+            null;
+        errdefer if (owned_stderr) |stderr| self.gpa.free(stderr);
         try postEvent(events, .{
             .tool_finished = .{
                 .index = tool_index,
                 .command = owned_command,
                 .body = owned_body,
                 .failed = failed,
+                .expanded = expanded,
+                .render = render,
+                .stderr_body = owned_stderr,
             },
         });
     }
@@ -295,6 +393,74 @@ pub const Agent = struct {
             .content = owned_content,
         });
     }
+
+    /// Append an assistant message that emitted at least one tool_call.
+    /// Per OpenAI's protocol the assistant message must carry the tool_calls
+    /// it produced so the subsequent `tool` messages can reference them by id.
+    fn appendAssistantTurn(
+        self: *Agent,
+        content: []const u8,
+        tool_calls: []const ai.ToolCall,
+        resolved_ids: []const []u8,
+    ) !void {
+        assert(tool_calls.len > 0);
+        assert(tool_calls.len == resolved_ids.len);
+
+        const owned_role = try self.gpa.dupe(u8, "assistant");
+        errdefer self.gpa.free(owned_role);
+        const owned_content = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(owned_content);
+
+        const stored = try self.gpa.alloc(ai.StoredToolCall, tool_calls.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (stored[0..initialized]) |tool_call| {
+                var owned = tool_call;
+                owned.deinit(self.gpa);
+            }
+            self.gpa.free(stored);
+        }
+
+        for (tool_calls, resolved_ids) |tool_call, id| {
+            const owned_id = try self.gpa.dupe(u8, id);
+            errdefer self.gpa.free(owned_id);
+            const owned_name = try self.gpa.dupe(u8, tool_call.name);
+            errdefer self.gpa.free(owned_name);
+            const owned_args = try self.gpa.dupe(u8, tool_call.arguments);
+            stored[initialized] = .{
+                .id = owned_id,
+                .name = owned_name,
+                .arguments = owned_args,
+            };
+            initialized += 1;
+        }
+
+        try self.messages.append(self.gpa, .{
+            .role = owned_role,
+            .content = owned_content,
+            .tool_calls = stored,
+        });
+    }
+
+    /// Append a `tool` role message carrying the result of one tool_call.
+    fn appendToolResult(
+        self: *Agent,
+        tool_call_id: []const u8,
+        content: []const u8,
+    ) !void {
+        assert(tool_call_id.len > 0);
+        const owned_role = try self.gpa.dupe(u8, "tool");
+        errdefer self.gpa.free(owned_role);
+        const owned_content = try self.gpa.dupe(u8, content);
+        errdefer self.gpa.free(owned_content);
+        const owned_id = try self.gpa.dupe(u8, tool_call_id);
+        errdefer self.gpa.free(owned_id);
+        try self.messages.append(self.gpa, .{
+            .role = owned_role,
+            .content = owned_content,
+            .tool_call_id = owned_id,
+        });
+    }
 };
 
 pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
@@ -304,6 +470,80 @@ pub fn parseCommand(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
     const command = parsed.value.object.get("command") orelse return error.InvalidToolArguments;
     if (command != .string) return error.InvalidToolArguments;
     return try gpa.dupe(u8, command.string);
+}
+
+/// Render a friendly title for a tool call. For `bash` we surface the command
+/// itself; for `write_file` and `edit_file` we surface the affected path(s)
+/// rather than the full JSON, since the JSON body for those tools is large
+/// and uninformative as a label. Falls back to bare `<name>` while the model
+/// is still streaming an incomplete argument JSON.
+pub fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
+    if (std.mem.eql(u8, name, "bash")) {
+        if (parseCommand(gpa, arguments)) |command| return command else |_| {}
+        return gpa.dupe(u8, "bash");
+    }
+    if (std.mem.eql(u8, name, "write_file")) {
+        if (formatWriteFileTitle(gpa, arguments)) |title| return title else |_| {}
+        return gpa.dupe(u8, "write_file");
+    }
+    if (std.mem.eql(u8, name, "edit_file")) {
+        if (formatEditFileTitle(gpa, arguments)) |title| return title else |_| {}
+        return gpa.dupe(u8, "edit_file");
+    }
+    return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
+}
+
+fn formatWriteFileTitle(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
+    const path = try parseJsonStringField(gpa, arguments, "path");
+    defer gpa.free(path);
+    return std.fmt.allocPrint(gpa, "write_file {s}", .{path});
+}
+
+fn formatEditFileTitle(gpa: std.mem.Allocator, arguments: []const u8) ![]u8 {
+    const input = try parseJsonStringField(gpa, arguments, "input");
+    defer gpa.free(input);
+    return formatEditFileTitleFromPatch(gpa, input);
+}
+
+fn parseJsonStringField(
+    gpa: std.mem.Allocator,
+    arguments: []const u8,
+    field: []const u8,
+) ![]u8 {
+    assert(arguments.len > 0);
+    assert(field.len > 0);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidToolArguments;
+    const value = parsed.value.object.get(field) orelse return error.MissingField;
+    if (value != .string) return error.InvalidToolArguments;
+    return gpa.dupe(u8, value.string);
+}
+
+fn formatEditFileTitleFromPatch(gpa: std.mem.Allocator, patch: []const u8) ![]u8 {
+    var first_path: ?[]const u8 = null;
+    var extra_count: u32 = 0;
+    var iter = std.mem.splitScalar(u8, patch, '\n');
+    while (iter.next()) |raw_line| {
+        const line = trimTrailingCR(raw_line);
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "@@")) continue;
+        const path = std.mem.trim(u8, trimmed[2..], " \t");
+        if (path.len == 0) continue;
+        if (first_path == null) {
+            first_path = path;
+            continue;
+        }
+        extra_count += 1;
+    }
+    const path = first_path orelse return error.NoPath;
+    if (extra_count == 0) return std.fmt.allocPrint(gpa, "edit_file {s}", .{path});
+    return std.fmt.allocPrint(gpa, "edit_file {s} (+{d} more)", .{ path, extra_count });
+}
+
+fn trimTrailingCR(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
 }
 
 test "parse bash command arguments" {
