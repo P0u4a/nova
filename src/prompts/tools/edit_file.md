@@ -42,24 +42,24 @@ When your edit involves brace boundaries (`{` / `}`), prefer these shapes:
 </common-failures>
 
 <case file="a.ts">
-1xa|const DEF = "guest";
-2lb|
-3wr|export function label(name) {
-4wg|	const clean = name || DEF;
-5xx|	return clean.trim();
-6qx|}
+#HL1xa|const DEF = "guest";
+#HL2lb|
+#HL3wr|export function label(name) {
+#HL4wg|	const clean = name || DEF;
+#HL5xx|	return clean.trim();
+#HL6qx|}
 </case>
 
 <case file="b.ts">
-1xt|const {
-2at|	events,
-3hd|	response,
-4fb|	requestId,
-5dm|} = await getStreamResponse(
-6zt|	request,
-7bu|	signal,
-8ae|);
-9ni|await notify(requestId);
+#HL1xt|const {
+#HL2at|	events,
+#HL3hd|	response,
+#HL4fb|	requestId,
+#HL5dm|} = await getStreamResponse(
+#HL6zt|	request,
+#HL7bu|	signal,
+#HL8ae|);
+#HL9ni|await notify(requestId);
 </case>
 
 <examples>
