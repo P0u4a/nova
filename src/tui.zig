@@ -90,7 +90,10 @@ pub const App = struct {
         self.tool_seen_in_response = false;
         self.awaiting_tool_call = true;
         self.pending_redraw = false;
-        self.thread_auto_scroll = true;
+        // Leave `thread_auto_scroll` alone — if the user has scrolled away
+        // from the tail to read older context, submitting another message
+        // should not yank them back. They can scroll down (or arrow-down)
+        // to opt back into auto-follow.
         self.tool_indexes.clearRetainingCapacity();
     }
 
@@ -162,10 +165,12 @@ pub const App = struct {
             .delta_end => {
                 const redraw = self.pending_redraw;
                 self.pending_redraw = false;
-                if (self.shouldShowResponseLoading()) {
-                    try self.appendLoading();
-                    return true;
-                }
+                // Once the model has started streaming (reasoning, content, or
+                // a tool call), we are committed to this turn — no need to put
+                // the spinner back between chunks. The visible streaming text
+                // is its own progress indicator, and any future "waiting" gap
+                // (between tool batches, or before the next turn) is handled
+                // by the explicit appendLoading sites.
                 return redraw;
             },
             .tool_finished => |tool| {
@@ -200,15 +205,6 @@ pub const App = struct {
         }
     }
 
-    fn shouldShowResponseLoading(self: *const App) bool {
-        if (!self.in_flight) return false;
-        if (self.loading_index != null) return false;
-        if (!self.awaiting_tool_call) return false;
-        if (self.tool_seen_in_response) return false;
-        if (self.agent_index != null) return true;
-        if (self.thinking_index != null) return true;
-        return false;
-    }
 
     fn applyContentDelta(self: *App, delta: []const u8) !void {
         if (delta.len == 0) return;
@@ -303,6 +299,10 @@ pub const App = struct {
     }
 
     fn selectGeneratedMessage(self: *App, index: u32) void {
+        // Re-assert selection only when the user is already on this exact
+        // message (or has no selection yet). A scrolled-up user, or a user
+        // parked at the tail while an *earlier* message is being finished,
+        // stays put.
         if (self.thread.selected) |selected| {
             if (selected != index) return;
         }
@@ -683,7 +683,14 @@ const ThreadWidget = struct {
     }
 
     fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
-        const cursor = self.app.loading_index orelse self.app.thread.selected orelse 0;
+        // When auto-following, the cursor is the live tail (loading spinner
+        // if present, otherwise the latest selectable). When the user has
+        // scrolled up, the cursor stays on their selection so ensureScroll
+        // does not drag the viewport away from what they were reading.
+        const cursor = if (self.app.thread_auto_scroll)
+            (self.app.loading_index orelse self.app.thread.selected orelse 0)
+        else
+            (self.app.thread.selected orelse self.app.loading_index orelse 0);
         const cursor_changed = self.app.thread_list.cursor != cursor;
         self.app.thread_list.cursor = cursor;
         if (self.app.thread_auto_scroll) {
@@ -1331,7 +1338,7 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expectEqual(.agent, app.thread.messages.items[2].kind);
 }
 
-test "loading appears after assistant text while waiting for tool call" {
+test "loading does not reappear between content chunks" {
     const gpa = std.testing.allocator;
     var openai_client: openai_mod.Client = undefined;
     try openai_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1:1", .api_key = "test", .model = "test" });
@@ -1345,13 +1352,14 @@ test "loading appears after assistant text while waiting for tool call" {
     try app.input.insertSliceAtCursor("implement dijkstra");
     _ = (try app.beginSubmit()).?;
 
+    // Once a content delta has arrived we are committed to streaming. The gap
+    // between chunks must NOT bring the spinner back — the streaming text is
+    // its own progress indicator.
     try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "Here's the implementation plan:" }));
-    try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
+    _ = try app.applyAgentEvent(.delta_end);
+    try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
     try std.testing.expectEqual(.agent, app.thread.messages.items[1].kind);
-    try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
-    try std.testing.expect(isLoadingWord(app.thread.messages.items[2].title));
 }
 
 test "structured tool keeps loading status while arguments stream" {

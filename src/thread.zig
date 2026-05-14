@@ -55,14 +55,31 @@ pub const Thread = struct {
         errdefer gpa.free(owned_body);
 
         const index: u32 = @intCast(self.messages.items.len);
+        const following_tail = self.isFollowingTail();
         try self.messages.append(gpa, .{
             .kind = kind,
             .title = owned_title,
             .body = owned_body,
             .expanded = kind == .user or kind == .agent or kind == .logo,
         });
-        if (kind.selectable()) self.selected = index;
+        if (kind.selectable() and following_tail) self.selected = index;
         return index;
+    }
+
+    /// True when no message is selected, or when the selection is at the last
+    /// selectable message in the thread (so streaming a new selectable message
+    /// should follow). Users who have scrolled up to an earlier message stop
+    /// "following the tail" and won't get yanked forward on the next append.
+    ///
+    /// `selected` is always a selectable index by invariant, and the only
+    /// non-selectable message that ever sits at the tail is the lone status
+    /// spinner — so it suffices to check the final one or two slots. O(1).
+    pub fn isFollowingTail(self: *const Thread) bool {
+        const selected = self.selected orelse return true;
+        const count: u32 = @intCast(self.messages.items.len);
+        if (selected + 1 == count) return true;
+        if (selected + 2 == count and !self.messages.items[count - 1].kind.selectable()) return true;
+        return false;
     }
 
     pub fn appendAgentDelta(
