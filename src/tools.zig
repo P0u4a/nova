@@ -7,8 +7,11 @@ const read = @import("tools/read.zig");
 const search_codebase = @import("tools/search_codebase.zig");
 const write_file = @import("tools/write_file.zig");
 
+const assert = std.debug.assert;
+
 pub const Output = common.Output;
 pub const Error = common.Error;
+pub const Result = bash.Result;
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -59,8 +62,39 @@ fn failFmt(gpa: std.mem.Allocator, code: u8, comptime fmt: []const u8, args: any
     return takeResult(&output);
 }
 
+/// Returns true when this tool's finished result should be shown with its
+/// body visible immediately, instead of collapsed behind its title. Tools
+/// that opt in are expected to populate `Output.display` with a rich body
+/// (`edit_file` emits a diff view; `write_file` emits the new file content).
+/// See CONTEXT.md's "Expand-by-default tool".
+pub fn defaultExpanded(name: []const u8) bool {
+    assert(name.len > 0);
+    if (std.mem.eql(u8, name, "edit_file")) return true;
+    if (std.mem.eql(u8, name, "write_file")) return true;
+    return false;
+}
+
+/// How a tool's display body should be coloured in the TUI.
+///   - `.plain`: single tool-green body (bash, read, search_codebase).
+///   - `.content`: single body in the muted "thinking" gray (write_file).
+///   - `.diff`: per-line colouring — `+` green, `-` red, else gray (edit_file).
+/// Failure overrides all three: a failed tool body is always rendered red.
+pub const Render = enum { plain, content, diff };
+
+pub fn renderMode(name: []const u8) Render {
+    assert(name.len > 0);
+    if (std.mem.eql(u8, name, "edit_file")) return .diff;
+    if (std.mem.eql(u8, name, "write_file")) return .content;
+    return .plain;
+}
+
 pub fn takeResult(output: *common.Output) bash.Result {
-    const result: bash.Result = .{ .stdout = output.stdout, .stderr = output.stderr, .code = output.code };
+    const result: bash.Result = .{
+        .stdout = output.stdout,
+        .stderr = output.stderr,
+        .code = output.code,
+        .display = output.display,
+    };
     output.* = undefined;
     return result;
 }
@@ -224,4 +258,5 @@ test {
     _ = @import("tools/hashline/hash.zig");
     _ = @import("tools/hashline/parse.zig");
     _ = @import("tools/hashline/apply.zig");
+    _ = @import("tools/hashline/render_diff.zig");
 }

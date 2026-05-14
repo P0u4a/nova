@@ -1,6 +1,10 @@
 const std = @import("std");
 const common = @import("common.zig");
 
+const assert = std.debug.assert;
+
+const tab_replacement: []const u8 = "    ";
+
 pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -37,8 +41,34 @@ fn write(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const u8, 
         return common.failFmt(gpa, 1, "write_file: write to {s} failed: {s}\n", .{ path, @errorName(err) });
     };
 
-    const message = std.fmt.allocPrint(gpa, "Successfully wrote {d} bytes to {s}\n", .{ content.len, path }) catch |err| return mapAllocError(err);
-    return common.ok(gpa, message);
+    return buildOutput(gpa, path, content);
+}
+
+fn buildOutput(gpa: std.mem.Allocator, path: []const u8, content: []const u8) common.Error!common.Output {
+    assert(path.len > 0);
+    const message = std.fmt.allocPrint(
+        gpa,
+        "Successfully wrote {s}",
+        .{path},
+    ) catch |err| return mapAllocError(err);
+    errdefer gpa.free(message);
+    if (content.len == 0) return common.ok(gpa, message);
+    const display = normaliseContent(gpa, content) catch |err| return mapAllocError(err);
+    return common.okWithDisplay(gpa, message, display);
+}
+
+fn normaliseContent(gpa: std.mem.Allocator, content: []const u8) ![]u8 {
+    assert(content.len > 0);
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(gpa);
+    for (content) |byte| {
+        if (byte == '\t') {
+            try buffer.appendSlice(gpa, tab_replacement);
+        } else {
+            try buffer.append(gpa, byte);
+        }
+    }
+    return buffer.toOwnedSlice(gpa);
 }
 
 fn joinPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {

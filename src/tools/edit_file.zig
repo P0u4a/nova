@@ -2,6 +2,9 @@ const std = @import("std");
 const common = @import("common.zig");
 const apply_mod = @import("hashline/apply.zig");
 const parse_mod = @import("hashline/parse.zig");
+const render_diff = @import("hashline/render_diff.zig");
+
+const assert = std.debug.assert;
 
 const max_file_bytes: usize = 16 * 1024 * 1024;
 
@@ -46,21 +49,59 @@ fn runPatchDocument(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, input: 
     errdefer stdout_buffer.deinit(gpa);
     var stderr_buffer: std.ArrayList(u8) = .empty;
     errdefer stderr_buffer.deinit(gpa);
+    var display_buffer: std.ArrayList(u8) = .empty;
+    errdefer display_buffer.deinit(gpa);
     var final_code: u8 = 0;
+    const multiple_sections = sections.items.len > 1;
 
     for (sections.items) |section| {
         var output = try runSingle(gpa, io, cwd, section.path, section.diff);
         defer output.deinit(gpa);
         try stdout_buffer.appendSlice(gpa, output.stdout);
         try stderr_buffer.appendSlice(gpa, output.stderr);
+        if (output.display) |display| {
+            try appendSectionDisplay(gpa, &display_buffer, section.path, display, multiple_sections);
+        }
         if (output.code != 0) final_code = output.code;
         if (output.code != 0) break;
     }
 
+    return finalizeDocument(gpa, &stdout_buffer, &stderr_buffer, &display_buffer, final_code);
+}
+
+fn appendSectionDisplay(
+    gpa: std.mem.Allocator,
+    buffer: *std.ArrayList(u8),
+    path: []const u8,
+    display: []const u8,
+    include_header: bool,
+) !void {
+    assert(display.len > 0);
+    if (buffer.items.len > 0) try buffer.append(gpa, '\n');
+    if (include_header) try buffer.print(gpa, "── {s} ──\n", .{path});
+    try buffer.appendSlice(gpa, display);
+    if (buffer.items[buffer.items.len - 1] != '\n') try buffer.append(gpa, '\n');
+}
+
+fn finalizeDocument(
+    gpa: std.mem.Allocator,
+    stdout_buffer: *std.ArrayList(u8),
+    stderr_buffer: *std.ArrayList(u8),
+    display_buffer: *std.ArrayList(u8),
+    code: u8,
+) !common.Output {
+    const display: ?[]u8 = blk: {
+        if (display_buffer.items.len == 0) {
+            display_buffer.deinit(gpa);
+            break :blk null;
+        }
+        break :blk try display_buffer.toOwnedSlice(gpa);
+    };
     return .{
         .stdout = try stdout_buffer.toOwnedSlice(gpa),
         .stderr = try stderr_buffer.toOwnedSlice(gpa),
-        .code = final_code,
+        .code = code,
+        .display = display,
     };
 }
 
@@ -141,7 +182,7 @@ fn runSingle(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, path: []const 
     const outcome = apply_mod.apply(gpa, original, edits) catch |err| {
         return common.failFmt(gpa, 1, "edit_file: apply failed: {s}\n", .{@errorName(err)});
     };
-    return finalize(gpa, io, path, absolute, outcome);
+    return finalize(gpa, io, path, absolute, outcome, original, edits);
 }
 
 fn finalize(
@@ -150,6 +191,8 @@ fn finalize(
     path: []const u8,
     absolute: []const u8,
     outcome: apply_mod.Outcome,
+    original: []const u8,
+    edits: []const parse_mod.Edit,
 ) common.Error!common.Output {
     switch (outcome) {
         .rejected => |mismatches| {
@@ -161,11 +204,28 @@ fn finalize(
             writeBack(io, absolute, applied.content) catch |err| {
                 return common.failFmt(gpa, 1, "edit_file: write to {s} failed: {s}\n", .{ path, @errorName(err) });
             };
-            const first = applied.first_changed_line orelse 0;
-            const message = std.fmt.allocPrint(gpa, "Edit applied to {s} (first changed line: {d}).\n", .{ path, first }) catch |err| return mapAllocError(err);
-            return common.ok(gpa, message);
+            return buildAppliedOutput(gpa, path, applied.first_changed_line, original, edits);
         },
     }
+}
+
+fn buildAppliedOutput(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    first_changed_line: ?u32,
+    original: []const u8,
+    edits: []const parse_mod.Edit,
+) common.Error!common.Output {
+    assert(edits.len > 0);
+    const first = first_changed_line orelse 0;
+    const message = std.fmt.allocPrint(
+        gpa,
+        "Edit applied to {s} (first changed line: {d}).\n",
+        .{ path, first },
+    ) catch |err| return mapAllocError(err);
+    errdefer gpa.free(message);
+    const display = render_diff.render(gpa, original, edits) catch |err| return mapAllocError(err);
+    return common.okWithDisplay(gpa, message, display);
 }
 
 fn formatRejection(

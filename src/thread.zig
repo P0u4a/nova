@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const tools = @import("tools.zig");
+
 const assert = std.debug.assert;
 
 pub const MessageKind = enum {
@@ -21,10 +23,18 @@ pub const Message = struct {
     body: []u8,
     expanded: bool = true,
     failed: bool = false,
+    /// Only meaningful when `kind == .tool`. Drives per-line styling of the
+    /// body in the TUI; see `tools.Render`.
+    tool_render: tools.Render = .plain,
+    /// Only meaningful when `kind == .tool`. The tool's stderr text, owned,
+    /// rendered in red below the gray body. Null when the tool produced no
+    /// stderr output.
+    stderr_body: ?[]u8 = null,
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         gpa.free(self.title);
         gpa.free(self.body);
+        if (self.stderr_body) |stderr| gpa.free(stderr);
         self.* = undefined;
     }
 };
@@ -193,12 +203,19 @@ pub const Thread = struct {
         gpa: std.mem.Allocator,
         index: u32,
         body: []const u8,
+        stderr_body: ?[]const u8,
         failed: bool,
     ) !void {
         assert(index < self.messages.items.len);
         const message = &self.messages.items[index];
         assert(message.kind == .tool);
         try appendOwned(gpa, &message.body, body);
+        if (stderr_body) |stderr| {
+            assert(stderr.len > 0);
+            const owned = try gpa.dupe(u8, stderr);
+            if (message.stderr_body) |existing| gpa.free(existing);
+            message.stderr_body = owned;
+        }
         message.failed = failed;
     }
 
@@ -284,7 +301,7 @@ test "consecutive tools remain separate messages" {
     defer thread.deinit(gpa);
 
     const first = try thread.startTool(gpa, "ls");
-    try thread.finishTool(gpa, first, "ls\n", false);
+    try thread.finishTool(gpa, first, "ls\n", null, false);
     const second = try thread.startTool(gpa, "pwd");
     try std.testing.expect(first != second);
     try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);

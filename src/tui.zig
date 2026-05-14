@@ -10,7 +10,7 @@ const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
 const loading_frames = [8][]const u8{ "⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶" };
 const loading_frame_ms = 40;
-
+// TODO: Investigate jumpToItem as an alternative to handrolling logic
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -205,7 +205,6 @@ pub const App = struct {
         }
     }
 
-
     fn applyContentDelta(self: *App, delta: []const u8) !void {
         if (delta.len == 0) return;
         if (self.agent_index) |index| {
@@ -257,7 +256,7 @@ pub const App = struct {
             const command = agent_mod.parseCommand(self.gpa, tool.arguments) catch return false;
             self.gpa.free(command);
         }
-        const title = try formatToolTitle(self.gpa, tool.name, tool.arguments);
+        const title = try agent_mod.formatToolTitle(self.gpa, tool.name, tool.arguments);
         defer self.gpa.free(title);
 
         if (std.mem.eql(u8, tool.name, "bash")) self.removeLoading();
@@ -275,13 +274,6 @@ pub const App = struct {
         return visible_change;
     }
 
-    fn formatToolTitle(gpa: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]u8 {
-        if (std.mem.eql(u8, name, "bash")) {
-            if (agent_mod.parseCommand(gpa, arguments)) |command| return command else |_| {}
-        }
-        return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, arguments });
-    }
-
     fn applyToolFinished(self: *App, tool: agent_mod.Agent.StreamEvent.ToolFinished) !bool {
         const existing_index = self.toolThreadIndex(tool.index);
         const index = if (existing_index) |index| index else index: {
@@ -291,11 +283,14 @@ pub const App = struct {
         };
 
         const visible_before = self.toolFinishVisibleChange(index, tool.command);
+        const was_expanded = self.thread.messages.items[index].expanded;
         try self.thread.updateTool(self.gpa, index, tool.command);
-        try self.thread.finishTool(self.gpa, index, tool.body, tool.failed);
+        try self.thread.finishTool(self.gpa, index, tool.body, tool.stderr_body, tool.failed);
+        self.thread.messages.items[index].expanded = tool.expanded;
+        self.thread.messages.items[index].tool_render = tool.render;
         self.selectGeneratedMessage(index);
         self.tool_seen_in_response = true;
-        return existing_index == null or visible_before;
+        return existing_index == null or visible_before or tool.expanded != was_expanded;
     }
 
     fn selectGeneratedMessage(self: *App, index: u32) void {
@@ -751,9 +746,8 @@ const MessageWidget = struct {
             .agent => drawWrapped(surface, self.message.body, .{}, self.selected, &row, ctx, 0, null),
             .logo => drawLogo(surface, self.message.body, &row, ctx),
             .tool => {
-                const body_style = toolBodyStyle(self.message);
                 drawWrapped(surface, self.message.title, StylePalette.tool, self.selected, &row, ctx, 0, null);
-                if (self.message.expanded) drawWrapped(surface, self.message.body, body_style, self.selected, &row, ctx, 0, null);
+                if (self.message.expanded) drawToolBody(surface, self.message, self.selected, &row, ctx);
             },
             .thinking => {
                 drawLine(surface, self.message.title, StylePalette.thinking_label, self.selected, &row, ctx, 2, StylePalette.thinking_bar);
@@ -984,10 +978,65 @@ fn visibleRows(
     return .{ .first = selected_end - height, .height = height };
 }
 
-fn toolBodyStyle(message: thread_mod.Message) vaxis.Style {
-    if (std.mem.eql(u8, message.body, "no output")) return StylePalette.thinking_body;
-    if (message.failed) return StylePalette.tool_failed;
-    return StylePalette.tool;
+fn drawToolBody(
+    surface: *vxfw.Surface,
+    message: thread_mod.Message,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+) void {
+    if (message.body.len > 0) {
+        switch (message.tool_render) {
+            .plain, .content => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
+            .diff => drawWrappedDiff(surface, message.body, selected, row, ctx),
+        }
+    }
+    if (message.stderr_body) |stderr| {
+        MessageWidget.drawWrapped(surface, stderr, StylePalette.tool_failed, selected, row, ctx, 0, null);
+    }
+}
+
+fn drawWrappedDiff(
+    surface: *vxfw.Surface,
+    text: []const u8,
+    selected: bool,
+    row: *u16,
+    ctx: vxfw.DrawContext,
+) void {
+    const content_width = ConversationLayout.contentWidth(surface.size.width);
+    const width = @max(@as(usize, content_width), 1);
+    if (text.len == 0) {
+        MessageWidget.drawLine(surface, "", StylePalette.thinking_body, selected, row, ctx, 0, null);
+        return;
+    }
+
+    var line_start: usize = 0;
+    while (line_start <= text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        const style = diffLineStyle(line);
+        if (line.len == 0) {
+            MessageWidget.drawLine(surface, "", style, selected, row, ctx, 0, null);
+        } else {
+            var chunk_start: usize = 0;
+            while (chunk_start < line.len) {
+                const chunk_end = @min(chunk_start + width, line.len);
+                MessageWidget.drawLine(surface, line[chunk_start..chunk_end], style, selected, row, ctx, 0, null);
+                chunk_start = chunk_end;
+            }
+        }
+        if (line_end == text.len) break;
+        line_start = line_end + 1;
+    }
+}
+
+fn diffLineStyle(line: []const u8) vaxis.Style {
+    if (line.len == 0) return StylePalette.thinking_body;
+    return switch (line[0]) {
+        '+' => StylePalette.tool,
+        '-' => StylePalette.tool_failed,
+        else => StylePalette.thinking_body,
+    };
 }
 
 const StylePalette = struct {
@@ -1082,10 +1131,17 @@ fn messageContentRows(message: thread_mod.Message, width: u16) u16 {
             1,
         .status => 1,
         .tool => if (message.expanded)
-            textRows(message.title, width) + textRows(message.body, width)
+            textRows(message.title, width) + toolBodyRows(message, width)
         else
             textRows(message.title, width),
     };
+}
+
+fn toolBodyRows(message: thread_mod.Message, width: u16) u16 {
+    var rows: u16 = 0;
+    if (message.body.len > 0) rows += textRows(message.body, width);
+    if (message.stderr_body) |stderr| rows += textRows(stderr, width);
+    return rows;
 }
 
 fn logoRows(text: []const u8) u16 {
@@ -1756,13 +1812,13 @@ test "collapsed tool messages render no body text" {
     defer thread.deinit(gpa);
 
     const index = try thread.startTool(gpa, "printf hello");
-    try thread.finishTool(gpa, index, "stdout:\nhello\nstderr:\n", false);
+    try thread.finishTool(gpa, index, "hello", null, false);
 
     try std.testing.expect(!thread.messages.items[index].expanded);
     try std.testing.expectEqual(@as(u16, 3), messageRows(thread.messages.items[index], 80));
     thread.toggleSelected();
     try std.testing.expect(thread.messages.items[index].expanded);
-    try std.testing.expectEqualStrings("stdout:\nhello\nstderr:\n", thread.messages.items[index].body);
+    try std.testing.expectEqualStrings("hello", thread.messages.items[index].body);
 }
 
 test "selected collapsed tools stay visible for tight viewport heights" {

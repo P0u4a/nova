@@ -7,10 +7,12 @@ pub const Result = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
+    display: ?[]u8 = null,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
+        if (self.display) |display| gpa.free(display);
         self.* = undefined;
     }
 };
