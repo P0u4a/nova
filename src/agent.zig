@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ai = @import("ai.zig");
+const hashline = @import("tools/hashline/hash.zig");
 const tools = @import("tools.zig");
 
 pub const Agent = struct {
@@ -178,7 +179,8 @@ pub const Agent = struct {
         errdefer buffer.deinit(gpa);
         if (stdout.len > 0) {
             try buffer.appendSlice(gpa, "stdout:\n");
-            try buffer.appendSlice(gpa, stdout);
+            // TODO: Extract this to a generic tool output formatter.
+            try hashline.appendStripped(gpa, &buffer, stdout);
             if (buffer.items[buffer.items.len - 1] != '\n') try buffer.append(gpa, '\n');
         }
         if (stderr.len > 0) {

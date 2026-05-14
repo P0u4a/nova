@@ -53,6 +53,38 @@ pub fn writeHashLine(
     try buffer.print(gpa, "{d}{s}{c}{s}", .{ line_number, hash, body_sep, line });
 }
 
+/// Append `text` to `buffer`, stripping a `LINE+HASH|` prefix from any line
+/// that has one. Lines that don't match the prefix pass through verbatim, so
+/// this is safe to apply to arbitrary tool output: only read-file-shaped
+/// lines actually get rewritten. Single pass over the input, O(n) total.
+pub fn appendStripped(
+    gpa: std.mem.Allocator,
+    buffer: *std.ArrayList(u8),
+    text: []const u8,
+) !void {
+    var iter = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (iter.next()) |line| {
+        if (!first) try buffer.append(gpa, '\n');
+        first = false;
+        try buffer.appendSlice(gpa, stripHashlinePrefix(line));
+    }
+}
+
+/// Return the byte slice of `line` with a leading `LINE+HASH|` removed if
+/// present. The original slice is returned unchanged when no such prefix is
+/// found.
+pub fn stripHashlinePrefix(line: []const u8) []const u8 {
+    if (line.len < 4) return line;
+    var i: usize = 0;
+    while (i < line.len and line[i] >= '0' and line[i] <= '9') i += 1;
+    if (i == 0 or i + 2 >= line.len) return line;
+    if (line[i] < 'a' or line[i] > 'z') return line;
+    if (line[i + 1] < 'a' or line[i + 1] > 'z') return line;
+    if (line[i + 2] != body_sep) return line;
+    return line[i + 3 ..];
+}
+
 /// Hashline-format every line of `text`. Lines are joined with `\n`.
 pub fn formatHashLines(gpa: std.mem.Allocator, text: []const u8, start_line: u32) ![]u8 {
     assert(start_line >= 1);
@@ -68,6 +100,24 @@ pub fn formatHashLines(gpa: std.mem.Allocator, text: []const u8, start_line: u32
         line_idx += 1;
     }
     return buffer.toOwnedSlice(gpa);
+}
+
+test "stripHashlinePrefix removes anchor and pipe" {
+    try std.testing.expectEqualStrings("function foo() {", stripHashlinePrefix("42sr|function foo() {"));
+    try std.testing.expectEqualStrings("plain text", stripHashlinePrefix("plain text"));
+    try std.testing.expectEqualStrings("", stripHashlinePrefix("1ab|"));
+    // A line that almost matches but lacks the pipe is left intact.
+    try std.testing.expectEqualStrings("42sr no pipe", stripHashlinePrefix("42sr no pipe"));
+    // Non-letter hash chars don't trigger the strip.
+    try std.testing.expectEqualStrings("42!!|foo", stripHashlinePrefix("42!!|foo"));
+}
+
+test "appendStripped strips every hashline-prefixed line" {
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try appendStripped(gpa, &buffer, "1ab|alpha\n2cd|beta\nbare line\n3ef|gamma");
+    try std.testing.expectEqualStrings("alpha\nbeta\nbare line\ngamma", buffer.items);
 }
 
 test "computeLineHash returns a 2-char bigram" {
