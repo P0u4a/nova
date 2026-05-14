@@ -1,4 +1,4 @@
-﻿pub const all = [_][]const u8{
+pub const all = [_][]const u8{
     "aa",
     "ab",
     "ac",
@@ -647,4 +647,3 @@
     "zy",
     "zz",
 };
-
