@@ -2,11 +2,23 @@ const std = @import("std");
 
 pub const openai = @import("ai/openai.zig");
 
+pub const ReasoningEffort = enum {
+    low,
+    medium,
+    high,
+    xhigh,
+
+    pub fn label(self: ReasoningEffort) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
     tools_json: []const u8 = "[]",
+    reasoning_effort: ?ReasoningEffort = .medium,
 };
 
 pub const ChatMessage = struct {

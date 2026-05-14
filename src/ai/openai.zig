@@ -78,7 +78,13 @@ pub const Client = struct {
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
-        try writeRequestPayload(&body_writer.writer, self.config.model, messages, self.config.tools_json);
+        try writeRequestPayload(
+            &body_writer.writer,
+            self.config.model,
+            messages,
+            self.config.tools_json,
+            self.config.reasoning_effort,
+        );
         try body_writer.end();
         try req.connection.?.flush();
 
@@ -100,6 +106,7 @@ fn writeRequestPayload(
     model: []const u8,
     messages: []const ai.ChatMessage,
     tools_json: []const u8,
+    reasoning_effort: ?ai.ReasoningEffort,
 ) !void {
     std.debug.assert(model.len > 0);
     std.debug.assert(tools_json.len > 0);
@@ -117,7 +124,13 @@ fn writeRequestPayload(
     }
     try out.writeAll("],\"stream\":true,\"tools\":");
     try out.writeAll(tools_json);
-    try out.writeAll(",\"tool_choice\":\"auto\"}");
+    try out.writeAll(",\"tool_choice\":\"auto\"");
+    if (reasoning_effort) |effort| {
+        try out.writeAll(",\"reasoning_effort\":\"");
+        try out.writeAll(effort.label());
+        try out.writeAll("\"");
+    }
+    try out.writeByte('}');
 }
 
 const ToolCallBuilder = struct {
