@@ -678,20 +678,25 @@ const ThreadWidget = struct {
     }
 
     fn syncCursor(self: *ThreadWidget, ctx: vxfw.DrawContext) void {
-        // When auto-following, the cursor is the live tail (loading spinner
-        // if present, otherwise the latest selectable). When the user has
-        // scrolled up, the cursor stays on their selection so ensureScroll
-        // does not drag the viewport away from what they were reading.
-        const cursor = if (self.app.thread_auto_scroll)
-            (self.app.loading_index orelse self.app.thread.selected orelse 0)
-        else
-            (self.app.thread.selected orelse self.app.loading_index orelse 0);
-        const cursor_changed = self.app.thread_list.cursor != cursor;
-        self.app.thread_list.cursor = cursor;
+        // Auto-scroll follows the actual tail of the thread, NOT the user's
+        // selection. The user can wheel-scroll to the bottom (turning auto-
+        // scroll on) while their selection still points at an earlier
+        // message — in that case we must keep them at the tail and leave
+        // the selection untouched. Tying the scroll cursor to `selected`
+        // here used to make every keystroke (which triggers a redraw via
+        // the focused TextField) snap the viewport up to the selection.
+        const messages = self.app.thread.messages.items;
+        if (messages.len == 0) return;
         if (self.app.thread_auto_scroll) {
+            const tail_index: u32 = @intCast(messages.len - 1);
+            const cursor = self.app.loading_index orelse tail_index;
+            self.app.thread_list.cursor = cursor;
             self.scrollCursorToTail(ctx, cursor);
             return;
         }
+        const cursor = self.app.thread.selected orelse self.app.loading_index orelse 0;
+        const cursor_changed = self.app.thread_list.cursor != cursor;
+        self.app.thread_list.cursor = cursor;
         if (cursor_changed) self.app.thread_list.ensureScroll();
     }
 
