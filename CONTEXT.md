@@ -1,3 +1,3 @@
 # Nova Agent
 
-Nova Agent is a coding-agent harness.
+Nova Agent is a coding agent harness.
