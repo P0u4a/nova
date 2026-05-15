@@ -8,6 +8,53 @@ const assert = std.debug.assert;
 
 const max_file_bytes: usize = 16 * 1024 * 1024;
 
+pub const tool: common.Tool = .{
+    .name = "edit_file",
+    .description = @embedFile("../prompts/tools/edit_file.md"),
+    .schema = .{
+        .properties = &.{
+            .{
+                .name = "input",
+                .kind = .string,
+                .description = "Hashline patch document only, not an explanation. Must contain at least one @@ PATH header, followed by hashline operations using anchors from read.",
+                .required = true,
+            },
+        },
+    },
+    .run = runTool,
+    .displayLabel = displayLabel,
+};
+
+/// Display label for edit_file. Parses the patch document's `@@ PATH`
+/// headers to surface the affected path(s) rather than the full patch.
+fn displayLabel(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error![]u8 {
+    const input = common.extractStringField(gpa, args, "input", "") catch return error.OutOfMemory;
+    defer gpa.free(input);
+    if (input.len == 0) return gpa.dupe(u8, "edit_file");
+    return labelFromPatch(gpa, input);
+}
+
+fn labelFromPatch(gpa: std.mem.Allocator, patch: []const u8) std.mem.Allocator.Error![]u8 {
+    var first_path: ?[]const u8 = null;
+    var extra_count: u32 = 0;
+    var iter = std.mem.splitScalar(u8, patch, '\n');
+    while (iter.next()) |raw_line| {
+        const line = trimTrailingCR(raw_line);
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "@@")) continue;
+        const path = std.mem.trim(u8, trimmed[2..], " \t");
+        if (path.len == 0) continue;
+        if (first_path == null) {
+            first_path = path;
+            continue;
+        }
+        extra_count += 1;
+    }
+    const path = first_path orelse return gpa.dupe(u8, "edit_file");
+    if (extra_count == 0) return std.fmt.allocPrint(gpa, "edit_file {s}", .{path});
+    return std.fmt.allocPrint(gpa, "edit_file {s} (+{d} more)", .{ path, extra_count });
+}
+
 pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,

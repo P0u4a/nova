@@ -5,6 +5,36 @@ const assert = std.debug.assert;
 
 const tab_replacement: []const u8 = "    ";
 
+pub const tool: common.Tool = .{
+    .name = "write_file",
+    .description = @embedFile("../prompts/tools/write_file.md"),
+    .schema = .{
+        .properties = &.{
+            .{
+                .name = "path",
+                .kind = .string,
+                .description = "Required. File path to create or overwrite, relative to the current working directory unless absolute.",
+                .required = true,
+            },
+            .{
+                .name = "content",
+                .kind = .string,
+                .description = "Required. Complete file content to write. Do not put the path here.",
+                .required = true,
+            },
+        },
+    },
+    .run = runTool,
+    .displayLabel = displayLabel,
+};
+
+fn displayLabel(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error![]u8 {
+    const path = common.extractStringField(gpa, args, "path", "") catch return error.OutOfMemory;
+    defer gpa.free(path);
+    if (path.len == 0) return gpa.dupe(u8, "write_file");
+    return std.fmt.allocPrint(gpa, "write_file {s}", .{path});
+}
+
 pub fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,

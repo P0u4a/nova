@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai.zig");
+const tools_common = @import("../tools/common.zig");
 
 const Scanner = std.json.Scanner;
 
@@ -17,7 +18,15 @@ pub const Client = struct {
     config: ai.Config,
     url: []u8,
     authorization: []u8,
+    /// Pre-built JSON for the OpenAI `tools` request field — derived from
+    /// `config.tools` (the protocol-neutral **Tool registry**) once at init.
+    tools_json: []u8,
     http_client: std.http.Client,
+    /// Monotonic counter for synthesised tool_call ids when the inference
+    /// server omits them. OpenAI's protocol requires stable ids linking
+    /// assistant tool_calls to their `tool` result messages, so we mint
+    /// one here rather than letting the agent see an empty id.
+    tool_call_seq: u64 = 0,
 
     pub fn init(
         target: *Client,
@@ -42,24 +51,29 @@ pub const Client = struct {
         );
         errdefer gpa.free(authorization);
 
+        const tools_json = try buildToolsJson(gpa, config.tools);
+        errdefer gpa.free(tools_json);
+
         target.* = .{
             .gpa = gpa,
             .io = io,
             .config = config,
             .url = url,
             .authorization = authorization,
+            .tools_json = tools_json,
             .http_client = .{ .allocator = gpa, .io = io },
         };
     }
 
     pub fn deinit(self: *Client) void {
         self.http_client.deinit();
+        self.gpa.free(self.tools_json);
         self.gpa.free(self.authorization);
         self.gpa.free(self.url);
         self.* = undefined;
     }
 
-    pub fn completeStream(
+    pub fn prompt(
         self: *Client,
         messages: []const ai.ChatMessage,
         observer: ai.StreamObserver,
@@ -82,7 +96,7 @@ pub const Client = struct {
             &body_writer.writer,
             self.config.model,
             messages,
-            self.config.tools_json,
+            self.tools_json,
             self.config.reasoning_effort,
         );
         try body_writer.end();
@@ -97,9 +111,62 @@ pub const Client = struct {
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
-        return try readStream(self.gpa, reader, observer);
+        return try readStream(self.gpa, reader, observer, &self.tool_call_seq);
     }
 };
+
+/// Build the OpenAI `tools` JSON array from the protocol-neutral
+/// **Tool registry**. Each adapter owns its own translation; this is the
+/// OpenAI version of "render a Tool into a tools-schema entry."
+/// Substitutes `{{hsep}}` → `~` in each tool's description template.
+fn buildToolsJson(gpa: std.mem.Allocator, tools: []const tools_common.Tool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const writer = &aw.writer;
+    try writer.writeByte('[');
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeToolDefinition(gpa, writer, tool);
+    }
+    try writer.writeByte(']');
+    return aw.toOwnedSlice();
+}
+
+fn writeToolDefinition(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    tool: tools_common.Tool,
+) !void {
+    const description = try std.mem.replaceOwned(u8, gpa, tool.description, "{{hsep}}", "~");
+    defer gpa.free(description);
+    try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+    try std.json.Stringify.value(tool.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(description, .{}, writer);
+    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{");
+    for (tool.schema.properties, 0..) |prop, p| {
+        if (p > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(prop.name, .{}, writer);
+        try writer.writeAll(":{\"type\":");
+        const kind_str: []const u8 = switch (prop.kind) {
+            .string => "string",
+            .integer => "integer",
+        };
+        try std.json.Stringify.value(kind_str, .{}, writer);
+        try writer.writeAll(",\"description\":");
+        try std.json.Stringify.value(prop.description, .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("},\"required\":[");
+    var written_required: u32 = 0;
+    for (tool.schema.properties) |prop| {
+        if (!prop.required) continue;
+        if (written_required > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(prop.name, .{}, writer);
+        written_required += 1;
+    }
+    try writer.writeAll("]}}}");
+}
 
 fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
@@ -114,14 +181,14 @@ fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
         try out.writeAll(",\"tool_calls\":[");
         for (message.tool_calls, 0..) |tool_call, index| {
             if (index > 0) try out.writeByte(',');
-            try writeStoredToolCall(out, tool_call);
+            try writeToolCall(out, tool_call);
         }
         try out.writeByte(']');
     }
     try out.writeByte('}');
 }
 
-fn writeStoredToolCall(out: *std.Io.Writer, tool_call: ai.StoredToolCall) !void {
+fn writeToolCall(out: *std.Io.Writer, tool_call: ai.ToolCall) !void {
     try out.writeAll("{\"id\":");
     try std.json.Stringify.value(tool_call.id, .{}, out);
     try out.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
@@ -171,10 +238,19 @@ const ToolCallBuilder = struct {
         self.* = undefined;
     }
 
-    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, index: u32) !ai.ToolCall {
+    /// Finalise the accumulated chunks into a canonical `ai.ToolCall`.
+    /// When the server omitted an id, synthesise one from `tool_call_seq`
+    /// — the agent never sees an empty id.
+    fn toToolCall(self: *ToolCallBuilder, gpa: std.mem.Allocator, tool_call_seq: *u64) !ai.ToolCall {
+        const id = if (self.id.items.len > 0)
+            try self.id.toOwnedSlice(gpa)
+        else id_blk: {
+            const minted = try std.fmt.allocPrint(gpa, "call_{d}", .{tool_call_seq.*});
+            tool_call_seq.* += 1;
+            break :id_blk minted;
+        };
         return .{
-            .index = index,
-            .id = try self.id.toOwnedSlice(gpa),
+            .id = id,
             .name = try self.name.toOwnedSlice(gpa),
             .arguments = try self.arguments.toOwnedSlice(gpa),
         };
@@ -185,6 +261,7 @@ fn readStream(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     observer: ai.StreamObserver,
+    tool_call_seq: *u64,
 ) !ai.Response {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
@@ -219,10 +296,9 @@ fn readStream(
     };
     errdefer result.deinit(gpa);
 
-    for (builders.items, 0..) |*builder, i| {
+    for (builders.items) |*builder| {
         if (builder.name.items.len == 0) continue;
-        const index: u32 = @intCast(i);
-        try result.tool_calls.append(gpa, try builder.toToolCall(gpa, index));
+        try result.tool_calls.append(gpa, try builder.toToolCall(gpa, tool_call_seq));
     }
     return result;
 }
@@ -281,23 +357,21 @@ fn applyChunkCallbacks(
     observer: ai.StreamObserver,
 ) !void {
     if (change.content_start) |start| {
-        if (observer.on_content_delta) |callback| {
-            try callback(observer.context, content[start..]);
-        }
+        try observer.on_content(observer.ptr, content[start..]);
     }
     if (change.reasoning_start) |start| {
-        if (observer.on_reasoning_delta) |callback| {
-            try callback(observer.context, reasoning[start..]);
-        }
+        try observer.on_reasoning(observer.ptr, reasoning[start..]);
     }
     for (change.tool_call_indexes[0..change.tool_call_count]) |idx| {
         const builder = builders[idx];
-        if (observer.on_tool_delta) |callback| {
-            try callback(observer.context, idx, builder.name.items, builder.arguments.items);
-        }
+        try observer.on_tool_delta(observer.ptr, .{
+            .index = idx,
+            .name = builder.name.items,
+            .arguments = builder.arguments.items,
+        });
     }
     if (change.empty()) return;
-    if (observer.on_delta_end) |callback| try callback(observer.context);
+    try observer.on_delta_end(observer.ptr);
 }
 
 fn processStreamChunk(
@@ -529,6 +603,39 @@ fn appendStringValue(scanner: *Scanner, gpa: std.mem.Allocator, list: *std.Array
     }
 }
 
+test "buildToolsJson produces a valid JSON array for the registry" {
+    const tools = @import("../tools.zig");
+    const gpa = std.testing.allocator;
+    const json = try buildToolsJson(gpa, tools.registry);
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read_file\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"write_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"path\",\"content\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Always include BOTH `path` and `content`.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, ":50-200") != null);
+}
+
+test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
+    const gpa = std.testing.allocator;
+    const tools = [_]tools_common.Tool{
+        .{
+            .name = "demo",
+            .description = "uses {{hsep}} marker",
+            .schema = .{ .properties = &.{} },
+            .run = undefined,
+            .displayLabel = undefined,
+        },
+    };
+    const json = try buildToolsJson(gpa, &tools);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "uses ~ marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "{{hsep}}") == null);
+}
+
 test "readStream accepts an SSE line larger than the transfer buffer" {
     const gpa = std.testing.allocator;
     var stream: std.ArrayList(u8) = .empty;
@@ -541,7 +648,8 @@ test "readStream accepts an SSE line larger than the transfer buffer" {
     try stream.appendSlice(gpa, "data: [DONE]\n");
 
     var reader: std.Io.Reader = .fixed(stream.items);
-    var response = try readStream(gpa, &reader, .{});
+    var tool_call_seq: u64 = 0;
+    var response = try readStream(gpa, &reader, ai.StreamObserver.noop, &tool_call_seq);
     defer response.deinit(gpa);
     try std.testing.expectEqual(@as(usize, transfer_buffer_bytes + 512), response.content.len);
 }
@@ -565,27 +673,24 @@ test "parse streaming tool deltas as they arrive" {
         arguments: []const u8 = "",
         index: u32 = 0,
 
-        fn onToolDelta(context: ?*anyopaque, index: u32, name: []const u8, arguments: []const u8) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context.?));
-            seen.index = index;
-            seen.name = name;
-            seen.arguments = arguments;
+        fn onToolDelta(context: *anyopaque, delta: ai.ToolDelta) anyerror!void {
+            const seen: *@This() = @ptrCast(@alignCast(context));
+            seen.index = delta.index;
+            seen.name = delta.name;
+            seen.arguments = delta.arguments;
         }
     };
     var seen: Seen = .{};
+    var observer = ai.StreamObserver.noop;
+    observer.ptr = &seen;
+    observer.on_tool_delta = Seen.onToolDelta;
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_tool_delta = Seen.onToolDelta,
-    });
+    , &content, &reasoning, &builders, observer);
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" build\"}"}}]}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_tool_delta = Seen.onToolDelta,
-    });
+    , &content, &reasoning, &builders, observer);
 
     try std.testing.expectEqualStrings("bash", seen.name);
     try std.testing.expectEqualStrings("{\"command\":\"zig build\"}", seen.arguments);
@@ -608,7 +713,7 @@ test "parse streaming tool deltas tolerate key reorder" {
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"function":{"name":"bash","arguments":"{}"},"id":"call_1","index":0}]}}]}
-    , &content, &reasoning, &builders, .{});
+    , &content, &reasoning, &builders, ai.StreamObserver.noop);
 
     try std.testing.expectEqual(@as(usize, 1), builders.items.len);
     try std.testing.expectEqualStrings("call_1", builders.items[0].id.items);
@@ -634,25 +739,25 @@ test "parse streaming tool deltas batches render notification per event" {
         tool_delta_count: u32 = 0,
         render_count: u32 = 0,
 
-        fn onToolDelta(context: ?*anyopaque, _: u32, _: []const u8, _: []const u8) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context.?));
+        fn onToolDelta(context: *anyopaque, _: ai.ToolDelta) anyerror!void {
+            const seen: *@This() = @ptrCast(@alignCast(context));
             seen.tool_delta_count += 1;
         }
 
-        fn onDeltaEnd(context: ?*anyopaque) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context.?));
+        fn onDeltaEnd(context: *anyopaque) anyerror!void {
+            const seen: *@This() = @ptrCast(@alignCast(context));
             seen.render_count += 1;
         }
     };
     var seen: Seen = .{};
+    var observer = ai.StreamObserver.noop;
+    observer.ptr = &seen;
+    observer.on_tool_delta = Seen.onToolDelta;
+    observer.on_delta_end = Seen.onDeltaEnd;
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_tool_delta = Seen.onToolDelta,
-        .on_delta_end = Seen.onDeltaEnd,
-    });
+    , &content, &reasoning, &builders, observer);
 
     try std.testing.expectEqual(@as(u32, 2), seen.tool_delta_count);
     try std.testing.expectEqual(@as(u32, 1), seen.render_count);
@@ -680,20 +785,20 @@ test "parse streaming reasoning deltas as they arrive" {
             self.reasoning.deinit(self.gpa);
         }
 
-        fn onReasoningDelta(context: ?*anyopaque, delta: []const u8) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context.?));
+        fn onReasoning(context: *anyopaque, delta: []const u8) anyerror!void {
+            const seen: *@This() = @ptrCast(@alignCast(context));
             try seen.reasoning.appendSlice(seen.gpa, delta);
         }
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
+    var observer = ai.StreamObserver.noop;
+    observer.ptr = &seen;
+    observer.on_reasoning = Seen.onReasoning;
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_reasoning_delta = Seen.onReasoningDelta,
-    });
+    , &content, &reasoning, &builders, observer);
 
     try std.testing.expectEqualStrings("checking output", seen.reasoning.items);
     try std.testing.expectEqualStrings("checking output", reasoning.items);
@@ -721,26 +826,23 @@ test "parse streaming content deltas as they arrive" {
             self.content.deinit(self.gpa);
         }
 
-        fn onContentDelta(context: ?*anyopaque, delta: []const u8) !void {
-            const seen: *@This() = @ptrCast(@alignCast(context.?));
+        fn onContent(context: *anyopaque, delta: []const u8) anyerror!void {
+            const seen: *@This() = @ptrCast(@alignCast(context));
             try seen.content.appendSlice(seen.gpa, delta);
         }
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
+    var observer = ai.StreamObserver.noop;
+    observer.ptr = &seen;
+    observer.on_content = Seen.onContent;
 
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_content_delta = Seen.onContentDelta,
-    });
+    , &content, &reasoning, &builders, observer);
     try processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"lo"}}]}
-    , &content, &reasoning, &builders, .{
-        .context = &seen,
-        .on_content_delta = Seen.onContentDelta,
-    });
+    , &content, &reasoning, &builders, observer);
 
     try std.testing.expectEqualStrings("hello", seen.content.items);
     try std.testing.expectEqualStrings("hello", content.items);

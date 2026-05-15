@@ -1,8 +1,13 @@
 const std = @import("std");
 
-const tools = @import("tools.zig");
-
 const assert = std.debug.assert;
+
+/// How a tool's display body should be drawn in the TUI.
+///   - `.plain`: single muted-gray body (bash output, file reads, etc.).
+///   - `.diff`: per-line — `+` green, `-` red, others gray (edit_file only).
+/// Failure overrides everything to red at draw time. See CONTEXT.md's
+/// **Color rule** and **Render** definitions.
+pub const Render = enum { plain, diff };
 
 pub const MessageKind = enum {
     user,
@@ -24,8 +29,8 @@ pub const Message = struct {
     expanded: bool = true,
     failed: bool = false,
     /// Only meaningful when `kind == .tool`. Drives per-line styling of the
-    /// body in the TUI; see `tools.Render`.
-    tool_render: tools.Render = .plain,
+    /// body in the TUI; see `Render`.
+    tool_render: Render = .plain,
     /// Only meaningful when `kind == .tool`. The tool's stderr text, owned,
     /// rendered in red below the gray body. Null when the tool produced no
     /// stderr output.

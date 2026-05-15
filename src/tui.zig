@@ -3,8 +3,59 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agent_mod = @import("agent.zig");
+const ai = @import("ai.zig");
 const openai_mod = @import("ai/openai.zig");
 const thread_mod = @import("thread.zig");
+const tools_mod = @import("tools.zig");
+
+const Render = thread_mod.Render;
+
+/// TUI display policy for a tool — Expand-by-default + Render mode.
+/// Lives here, *not* in the tool layer: the agent and the tools know
+/// nothing about how the TUI draws their results.
+const ToolPolicy = struct {
+    expand_by_default: bool,
+    render: Render,
+};
+
+/// One entry per tool in the **Tool registry**. The comptime block below
+/// asserts the table covers exactly the registry — no missing tools, no
+/// orphan entries. Adding a tool requires explicitly choosing a display
+/// policy here; forgetting is a build error, not a silent fall-back to
+/// "plain, collapsed."
+const tool_policies = [_]struct { name: []const u8, policy: ToolPolicy }{
+    .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "read", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "search_codebase", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "write_file", .policy = .{ .expand_by_default = true, .render = .plain } },
+    .{ .name = "edit_file", .policy = .{ .expand_by_default = true, .render = .diff } },
+};
+
+comptime {
+    // Every tool in the registry has a policy entry.
+    for (tools_mod.registry) |tool| {
+        var found = false;
+        for (tool_policies) |p| if (std.mem.eql(u8, p.name, tool.name)) {
+            found = true;
+        };
+        if (!found) @compileError("missing TUI policy for tool: " ++ tool.name);
+    }
+    // Every policy entry maps to a registry tool — no orphans.
+    for (tool_policies) |p| {
+        var found = false;
+        for (tools_mod.registry) |tool| if (std.mem.eql(u8, p.name, tool.name)) {
+            found = true;
+        };
+        if (!found) @compileError("orphan TUI policy entry: " ++ p.name);
+    }
+}
+
+fn policyFor(name: []const u8) ToolPolicy {
+    for (tool_policies) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.policy;
+    }
+    unreachable; // guaranteed by the comptime check above
+}
 
 const logo_bytes_max = 64 * 1024;
 const loading_spinners = [4][]const u8{ "Firing Neurons", "Multiplying Matrices", "brr..brr...", "Warping" };
@@ -135,9 +186,10 @@ pub const App = struct {
         if (self.loading_frame >= loading_frames.len) self.loading_frame = 0;
     }
 
-    pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.StreamEvent) !bool {
+    pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
         switch (event) {
-            .content_delta => |delta| {
+            .turn_started => return false,
+            .response_delta => |delta| {
                 self.removeLoading();
                 if (delta.len == 0) return false;
                 _ = try self.finishThinking();
@@ -145,7 +197,7 @@ pub const App = struct {
                 self.pending_redraw = true;
                 return true;
             },
-            .reasoning_delta => |delta| {
+            .thinking_delta => |delta| {
                 self.removeLoading();
                 if (try self.applyReasoningDelta(delta)) {
                     self.pending_redraw = true;
@@ -173,7 +225,7 @@ pub const App = struct {
                 // by the explicit appendLoading sites.
                 return redraw;
             },
-            .tool_finished => |tool| {
+            .tool_call_finished => |tool| {
                 self.removeLoading();
                 const thinking_finished = try self.finishThinking();
                 return thinking_finished or try self.applyToolFinished(tool);
@@ -251,7 +303,7 @@ pub const App = struct {
         return visible_change;
     }
 
-    fn applyToolDelta(self: *App, tool: agent_mod.Agent.StreamEvent.ToolDelta) !bool {
+    fn applyToolDelta(self: *App, tool: ai.ToolDelta) !bool {
         if (std.mem.eql(u8, tool.name, "bash")) {
             const command = agent_mod.parseCommand(self.gpa, tool.arguments) catch return false;
             self.gpa.free(command);
@@ -274,23 +326,24 @@ pub const App = struct {
         return visible_change;
     }
 
-    fn applyToolFinished(self: *App, tool: agent_mod.Agent.StreamEvent.ToolFinished) !bool {
+    fn applyToolFinished(self: *App, tool: agent_mod.Agent.Event.ToolCallFinished) !bool {
+        const policy = policyFor(tool.name);
         const existing_index = self.toolThreadIndex(tool.index);
         const index = if (existing_index) |index| index else index: {
-            const created = try self.thread.startTool(self.gpa, tool.command);
+            const created = try self.thread.startTool(self.gpa, tool.display_label);
             try self.putToolThreadIndex(tool.index, created);
             break :index created;
         };
 
-        const visible_before = self.toolFinishVisibleChange(index, tool.command);
+        const visible_before = self.toolFinishVisibleChange(index, tool.display_label);
         const was_expanded = self.thread.messages.items[index].expanded;
-        try self.thread.updateTool(self.gpa, index, tool.command);
-        try self.thread.finishTool(self.gpa, index, tool.body, tool.stderr_body, tool.failed);
-        self.thread.messages.items[index].expanded = tool.expanded;
-        self.thread.messages.items[index].tool_render = tool.render;
+        try self.thread.updateTool(self.gpa, index, tool.display_label);
+        try self.thread.finishTool(self.gpa, index, tool.display_body, tool.stderr, tool.failed);
+        self.thread.messages.items[index].expanded = policy.expand_by_default;
+        self.thread.messages.items[index].tool_render = policy.render;
         self.selectGeneratedMessage(index);
         self.tool_seen_in_response = true;
-        return existing_index == null or visible_before or tool.expanded != was_expanded;
+        return existing_index == null or visible_before or policy.expand_by_default != was_expanded;
     }
 
     fn selectGeneratedMessage(self: *App, index: u32) void {
@@ -373,13 +426,13 @@ fn chooseLoadingWordIndex(io: std.Io) u8 {
 
 const AgentEventQueue = struct {
     mutex: std.Io.Mutex = .init,
-    items: std.ArrayList(*agent_mod.Agent.StreamEvent) = .empty,
+    items: std.ArrayList(*agent_mod.Agent.Event) = .empty,
 
     fn push(
         self: *AgentEventQueue,
         io: std.Io,
         gpa: std.mem.Allocator,
-        event: *agent_mod.Agent.StreamEvent,
+        event: *agent_mod.Agent.Event,
     ) !void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
@@ -390,7 +443,7 @@ const AgentEventQueue = struct {
         self: *AgentEventQueue,
         io: std.Io,
         gpa: std.mem.Allocator,
-        sink: *std.ArrayList(*agent_mod.Agent.StreamEvent),
+        sink: *std.ArrayList(*agent_mod.Agent.Event),
     ) !void {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
@@ -417,9 +470,9 @@ const AgentWorkerContext = struct {
 };
 
 fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *AgentWorkerContext) void {
-    agent.turn(.{
-        .context = worker_context,
-        .post = postAgentEvent,
+    agent.run(.{
+        .ptr = worker_context,
+        .on_event = postAgentEvent,
     }) catch |err| {
         const message = std.fmt.allocPrint(
             worker_context.gpa,
@@ -434,11 +487,11 @@ fn runAgentTurn(agent: *agent_mod.Agent, worker_context: *AgentWorkerContext) vo
     postAgentEvent(worker_context, .turn_finished) catch {};
 }
 
-fn postAgentEvent(context: ?*anyopaque, event: agent_mod.Agent.StreamEvent) !void {
-    const worker_context: *AgentWorkerContext = @ptrCast(@alignCast(context.?));
+fn postAgentEvent(context: *anyopaque, event: agent_mod.Agent.Event) anyerror!void {
+    const worker_context: *AgentWorkerContext = @ptrCast(@alignCast(context));
     var owned_event = event;
     errdefer owned_event.deinit(worker_context.gpa);
-    const event_ptr = try worker_context.gpa.create(agent_mod.Agent.StreamEvent);
+    const event_ptr = try worker_context.gpa.create(agent_mod.Agent.Event);
     errdefer worker_context.gpa.destroy(event_ptr);
     event_ptr.* = owned_event;
     owned_event = .delta_end;
@@ -567,7 +620,7 @@ const RootWidget = struct {
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
         const worker_io = self.app.worker_context.io;
         const worker_gpa = self.app.worker_context.gpa;
-        var batch: std.ArrayList(*agent_mod.Agent.StreamEvent) = .empty;
+        var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
         defer batch.deinit(worker_gpa);
         try self.app.worker_context.queue.drainInto(worker_io, worker_gpa, &batch);
 
@@ -992,7 +1045,7 @@ fn drawToolBody(
 ) void {
     if (message.body.len > 0) {
         switch (message.tool_render) {
-            .plain, .content => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
+            .plain => MessageWidget.drawWrapped(surface, message.body, StylePalette.thinking_body, selected, row, ctx, 0, null),
             .diff => drawWrappedDiff(surface, message.body, selected, row, ctx),
         }
     }
@@ -1223,11 +1276,11 @@ test "empty text deltas do not create selectable messages" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .content_delta = "" }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "" }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "" }));
     try std.testing.expectEqual(@as(usize, 1), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
 }
@@ -1246,17 +1299,18 @@ test "agent app events update thread on the ui side" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "checking" }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking" }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = " files" }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = " files" }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "ls",
-        .body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
@@ -1282,13 +1336,13 @@ test "user can navigate away from a streaming thinking block" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    _ = try app.applyAgentEvent(.{ .reasoning_delta = "first chunk" });
+    _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
     try std.testing.expectEqual(.thinking, app.thread.messages.items[app.thread.selected.?].kind);
 
     app.thread.moveSelection(.previous);
     try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 
-    _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
+    _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
     try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 }
 
@@ -1306,13 +1360,13 @@ test "user can navigate away from a streaming agent message" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    _ = try app.applyAgentEvent(.{ .content_delta = "first chunk" });
+    _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
     try std.testing.expectEqual(.agent, app.thread.messages.items[app.thread.selected.?].kind);
 
     app.thread.moveSelection(.previous);
     try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 
-    _ = try app.applyAgentEvent(.{ .content_delta = " more" });
+    _ = try app.applyAgentEvent(.{ .response_delta = " more" });
     try std.testing.expectEqual(.user, app.thread.messages.items[app.thread.selected.?].kind);
 }
 
@@ -1330,17 +1384,17 @@ test "empty content delta does not finalize thinking" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    _ = try app.applyAgentEvent(.{ .reasoning_delta = "thinking" });
+    _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
     const thinking_index = app.thinking_index.?;
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
-    _ = try app.applyAgentEvent(.{ .content_delta = "" });
+    _ = try app.applyAgentEvent(.{ .response_delta = "" });
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
-    _ = try app.applyAgentEvent(.{ .reasoning_delta = " more" });
+    _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
     try std.testing.expectEqualStrings("Thinking...", app.thread.messages.items[thinking_index].title);
 
-    _ = try app.applyAgentEvent(.{ .content_delta = "answer" });
+    _ = try app.applyAgentEvent(.{ .response_delta = "answer" });
     try std.testing.expectEqualStrings("Thoughts", app.thread.messages.items[thinking_index].title);
 }
 
@@ -1358,11 +1412,11 @@ test "content deltas do not override user scroll state" {
     try app.input.insertSliceAtCursor("hello");
     _ = (try app.beginSubmit()).?;
 
-    _ = try app.applyAgentEvent(.{ .content_delta = "first" });
+    _ = try app.applyAgentEvent(.{ .response_delta = "first" });
     try std.testing.expect(app.thread_auto_scroll);
 
     app.thread_auto_scroll = false;
-    _ = try app.applyAgentEvent(.{ .content_delta = " second" });
+    _ = try app.applyAgentEvent(.{ .response_delta = " second" });
     try std.testing.expect(!app.thread_auto_scroll);
 }
 
@@ -1385,15 +1439,16 @@ test "loading does not appear during final answer after tool batch" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "pwd",
-        .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
+        .name = "bash",
+        .display_label = "pwd",
+        .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expectEqual(.status, app.thread.messages.items[2].kind);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "Final answer" }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
     try std.testing.expectEqual(.agent, app.thread.messages.items[2].kind);
@@ -1416,7 +1471,7 @@ test "loading does not reappear between content chunks" {
     // Once a content delta has arrived we are committed to streaming. The gap
     // between chunks must NOT bring the spinner back — the streaming text is
     // its own progress indicator.
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "Here's the implementation plan:" }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Here's the implementation plan:" }));
     _ = try app.applyAgentEvent(.delta_end);
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
@@ -1447,10 +1502,11 @@ test "structured tool keeps loading status while arguments stream" {
     try std.testing.expectEqual(.status, app.thread.messages.items[1].kind);
     try std.testing.expectEqual(.tool, app.thread.messages.items[2].kind);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "write_file {\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");\"}",
-        .body = "Successfully wrote 27 bytes to main.zig\n",
+        .name = "write_file",
+        .display_label = "write_file {\"path\":\"main.zig\",\"content\":\"const std = @import(\\\"std\\\");\"}",
+        .display_body = "Successfully wrote 27 bytes to main.zig\n",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
@@ -1485,10 +1541,11 @@ test "tool row persists through finish and turn completion" {
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
     try std.testing.expectEqualStrings("$ ls", app.thread.messages.items[1].title);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "ls",
-        .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
     try std.testing.expectEqual(.tool, app.thread.messages.items[1].kind);
@@ -1552,10 +1609,11 @@ test "tool finish creates row if no complete streamed arguments appeared" {
         .name = "bash",
         .arguments = "{\"command\":\"",
     } }));
-    try std.testing.expect(try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "ls",
-        .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
 
     try std.testing.expectEqual(@as(usize, 2), app.thread.messages.items.len);
@@ -1582,10 +1640,11 @@ test "new tool response index creates a new thread row" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "ls",
-        .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
 
@@ -1630,15 +1689,16 @@ test "late tool finish does not move selection upward" {
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "ls",
-        .body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
+        .name = "bash",
+        .display_label = "ls",
+        .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "done" }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "done" }));
     try std.testing.expectEqual(@as(u32, 3), app.thread.selected.?);
 }
 
@@ -1661,14 +1721,15 @@ test "loading does not resume after post-tool thinking delta" {
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "pwd",
-        .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
+        .name = "bash",
+        .display_label = "pwd",
+        .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .reasoning_delta = "checking output" }));
+    try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking output" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
     try std.testing.expectEqual(@as(usize, 3), app.thread.messages.items.len);
@@ -1692,19 +1753,20 @@ test "agent response after tool batch appears below tool rows" {
     try app.input.insertSliceAtCursor("inspect");
     _ = (try app.beginSubmit()).?;
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "I will check." }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\"}",
     } }));
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "pwd",
-        .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
+        .name = "bash",
+        .display_label = "pwd",
+        .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "The repo is in /tmp." }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "The repo is in /tmp." }));
 
     try std.testing.expectEqual(@as(usize, 4), app.thread.messages.items.len);
     try std.testing.expectEqual(.user, app.thread.messages.items[0].kind);
@@ -1731,7 +1793,7 @@ test "content delta after tool preview does not move selection away from tool ro
     try app.input.insertSliceAtCursor("inspect");
     _ = (try app.beginSubmit()).?;
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = "I will check." }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(u32, 1), app.thread.selected.?);
 
@@ -1743,14 +1805,15 @@ test "content delta after tool preview does not move selection away from tool ro
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
-    try std.testing.expect(try app.applyAgentEvent(.{ .content_delta = " Still checking." }));
+    try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = " Still checking." }));
     _ = try app.applyAgentEvent(.delta_end);
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
 
-    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_finished = .{
+    try std.testing.expect(!try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
-        .command = "pwd",
-        .body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
+        .name = "bash",
+        .display_label = "pwd",
+        .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
     try std.testing.expectEqual(@as(u32, 2), app.thread.selected.?);
     try std.testing.expectEqualStrings("I will check. Still checking.", app.thread.messages.items[1].body);

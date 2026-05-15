@@ -7,6 +7,30 @@ const max_output_lines: u32 = 2000;
 const max_output_bytes: usize = 50 * 1024;
 const max_directory_entries: u32 = 2000;
 
+pub const tool: common.Tool = .{
+    .name = "read",
+    .description = @embedFile("../prompts/tools/read.md"),
+    .schema = .{
+        .properties = &.{
+            .{
+                .name = "path",
+                .kind = .string,
+                .description = "Required. File or directory path to read. Append selectors like :50, :50-200, :50+150, :raw, or :conflicts.",
+                .required = true,
+            },
+        },
+    },
+    .run = runTool,
+    .displayLabel = displayLabel,
+};
+
+fn displayLabel(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error![]u8 {
+    const path = common.extractStringField(gpa, args, "path", "") catch return error.OutOfMemory;
+    defer gpa.free(path);
+    if (path.len == 0) return gpa.dupe(u8, "read");
+    return std.fmt.allocPrint(gpa, "read {s}", .{path});
+}
+
 const Args = struct {
     path: []const u8,
     selector: Selector = .anchored,
