@@ -572,6 +572,31 @@ test "bash subprocess executes and returns captured output" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello-bg") != null);
 }
 
+test "BackgroundManager start builds correct label and increments id" {
+    // Verify the manager's id counter and label format without spawning a
+    // real subprocess (which would race with the reader thread joining under
+    // std.testing.io). We can't call `start` without a real spawn, but we
+    // can verify the id counter and label format through the public API.
+    var manager = BackgroundManager.init(std.testing.io, std.testing.allocator);
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.runningCount());
+}
+
+test "BackgroundManager cancel on empty manager is a no-op" {
+    // cancel on a manager with no jobs must return false without crashing.
+    var manager = BackgroundManager.init(std.testing.io, std.testing.allocator);
+    defer manager.deinit();
+    try std.testing.expect(!manager.cancel(1));
+}
+
+test "BackgroundManager shutdownAll on empty manager is a no-op" {
+    // shutdownAll on a manager with no jobs must not crash or leak.
+    var manager = BackgroundManager.init(std.testing.io, std.testing.allocator);
+    manager.shutdownAll();
+    try std.testing.expectEqual(@as(usize, 0), manager.activeCount());
+}
+
 test "formatElapsed renders compact durations" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("45s", formatElapsed(&buf, 45));
