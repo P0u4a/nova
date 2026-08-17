@@ -480,44 +480,54 @@ pub const Agent = struct {
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);
-        self.snapshotAfterBatch();
+        _ = self.snapshotNow();
         try listener.emit(.tool_batch_finished);
     }
 
-    /// After a tool batch, snapshot the working tree (git-shadow) and bind it to
-    /// the batch's last conversation entry, giving per-tool-batch timeline
-    /// granularity. Runs on the worker thread — the only thread that writes
-    /// session entries during a turn — so binding via `setLeafSnapshot` (which
-    /// flushes the writer) can't race a concurrent append.
+    pub const SnapshotOutcome = enum {
+        sealed,
+        unchanged,
+        no_leaf,
+        unavailable,
+        failed,
+    };
+
+    /// Snapshot the working tree (git-shadow) and bind the commit to the active
+    /// conversation leaf, so navigating back here restores this code state.
+    ///
+    /// The single snapshot entry point. Called after every tool batch (giving
+    /// per-tool-batch timeline granularity) and at turn boundaries by the
+    /// workspace; both share this one implementation and the one piece of dedup
+    /// state, so a checkpoint means the same thing wherever it is taken.
     ///
     /// Authoritative change-detection without trusting tool output: the
     /// content-addressed tree id is compared to the last snapshot's; an unchanged
     /// tree (a read-only batch, or a build that only touched gitignored files) is
-    /// skipped, creating no object and no binding. Best-effort — any failure
-    /// latches snapshots off for the session rather than failing the turn.
-    fn snapshotAfterBatch(self: *Agent) void {
-        if (self.snapshots_disabled) return;
-        const session_writer = self.context_manager.session_writer orelse return;
+    pub fn snapshotNow(self: *Agent) SnapshotOutcome {
+        if (self.snapshots_disabled) return .unavailable;
+        const session_writer = self.context_manager.session_writer orelse return .no_leaf;
         const index = self.snapshot_index orelse blk: {
             if (!vcs.isAvailable(self.gpa, self.io) or !vcs.isRepo(self.gpa, self.io, self.cwd)) {
                 self.snapshots_disabled = true;
-                return;
+                return .unavailable;
             }
             const path = vcs.indexPath(self.gpa, self.io, self.cwd) catch {
                 self.snapshots_disabled = true;
-                return;
+                return .unavailable;
             };
             self.snapshot_index = path;
             break :blk path;
         };
-        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return;
+        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return .failed;
         if (self.last_snapshot_tree) |last| {
-            if (tree.eql(last)) return; // batch changed nothing tracked — no node
+            if (tree.eql(last)) return .unchanged; // nothing tracked changed — no node
         }
-        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return;
-        session_writer.setLeafSnapshot(commit.slice()) catch return;
-        if (session_writer.leaf()) |leaf_id| vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
+        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return .failed;
+        session_writer.setLeafSnapshot(commit.slice()) catch return .failed;
         self.last_snapshot_tree = tree;
+        const leaf_id = session_writer.leaf() orelse return .no_leaf;
+        vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
+        return .sealed;
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the

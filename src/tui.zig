@@ -15,12 +15,12 @@ const openai_compatible_mod = @import("ai/openai_compatible.zig");
 const runtime_mod = @import("runtime.zig");
 const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
+const workspace_mod = @import("workspace.zig");
 const skill_mod = @import("skill.zig");
 const symbols = @import("symbols.zig");
 const transcript_mod = @import("transcript.zig");
 const CountingAllocator = @import("counting_allocator").CountingAllocator;
 const agent_worker = @import("tui/agent_worker.zig");
-const naming_mod = @import("tui/naming.zig");
 const Turn = @import("tui/turn.zig");
 const model_catalogue = @import("tui/model_catalogue.zig");
 const tui_turn_view = @import("tui/turn_view.zig");
@@ -133,14 +133,12 @@ const ChipRect = struct {
 pub const App = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    /// All lanes the developer has open, heap-allocated so their addresses stay
-    /// stable while live runtimes and (later) worker threads hold references.
-    /// Owns the `Thread`s; freed in `deinit`.
-    threads: std.ArrayList(*Thread) = .empty,
-    /// The lane currently on screen — always one of `threads`. A pointer (not an
-    /// index) so every `self.thread.X` site reads/mutates the active lane through
-    /// auto-deref, even from a `*const App`.
-    thread: *Thread,
+    /// The lanes and everything that acts on them — forking, parking, merging,
+    /// sessions, checkpoints, timeline, background-job routing. `App` owns the
+    /// workspace but never reaches past it into git or the session tree: this is
+    /// the seam that keeps presentation out of the harness. `ws.active` is the
+    /// lane on screen.
+    ws: workspace_mod.Workspace,
     /// When true and there's more than one lane, the transcript area tiles all
     /// lanes as columns; otherwise only the active lane shows full-width
     /// ("fullscreen"). Set true on opening a parallel lane and toggled by
@@ -159,10 +157,6 @@ pub const App = struct {
     /// Parsed state for the `/diff` viewer. Populated by `openDiffViewer`, reset
     /// to `.{}` on exit. Only meaningful while `mode == .diff_viewer`.
     diff: diff_viewer.State = .{},
-    /// Lazily-resolved readiness of git-shadow snapshotting: `.unknown` until the
-    /// first boundary probes git + that the cwd is a repo, then cached.
-    /// `.unavailable` keeps the feature inert when git isn't available.
-    checkpoint_state: CheckpointState = .unknown,
     /// True once a snapshot has failed and we've told the user. Stops the
     /// per-turn failure notice from repeating every turn while git is wedged.
     checkpoint_warned: bool = false,
@@ -265,37 +259,18 @@ pub const App = struct {
     at_selection: u32 = 0,
     at_indexing: bool = false,
     at_kind: MentionSearchKind = .file,
-    /// Shared manager for `run_in_background` bash commands. Heap-allocated (so
-    /// its address is stable for the agents that borrow it) and owned here; null
-    /// on the headless/test path. See `background.zig`.
-    background: ?*background_mod.BackgroundManager = null,
     /// `Ctrl+O` background-jobs modal: open flag, selected row, and whether the
     /// `[CANCEL]` button column has focus (right-arrow). Mirrors the permission
     /// overlay's lightweight, mode-less state.
     background_modal: bool = false,
     background_selection: usize = 0,
     background_cancel_focus: bool = false,
-    /// Completed background jobs awaiting delivery. Held here (not pushed into a
-    /// busy transcript) so the notice + model message land only when the owning
-    /// lane is idle — "auto-start if idle, queue if in-flight". Owned; freed in
-    /// `deinit`.
-    background_pending: std.ArrayList(BackgroundDelivery) = .empty,
 
     pub const ctrl_c_double_press_ms: u32 = 1500;
-
-    /// A finished background job buffered for delivery to its owning lane.
-    /// `owner` is the opaque `*Agent` token from the manager; `message` is the
-    /// model-facing completion text (null when the job was killed — notice only).
-    const BackgroundDelivery = struct {
-        owner: *anyopaque,
-        notice: []u8,
-        message: ?[]u8,
-    };
 
     const Mode = enum { normal, command, session_picker, provider_picker, model_picker, tree_picker, diff_viewer, save_message, lanes };
     const LanesPurpose = enum { manage, merge_dest };
     const ModelCatalog = enum { connected_provider, openai_codex };
-    const CheckpointState = enum { unknown, ready, unavailable };
     const ModelSource = model_loader.ModelSource;
     const ModelScope = model_catalogue.ModelScope;
     const catalogue_provider_count = config_mod.catalogueProviders().len;
@@ -304,14 +279,10 @@ pub const App = struct {
         const primary = try gpa.create(Thread);
         errdefer gpa.destroy(primary);
         primary.* = .{ .agent = agent, .worker_context = .{ .io = io, .gpa = agent.gpa } };
-        var threads: std.ArrayList(*Thread) = .empty;
-        errdefer threads.deinit(gpa);
-        try threads.append(gpa, primary);
         return .{
             .io = io,
             .gpa = gpa,
-            .threads = threads,
-            .thread = primary,
+            .ws = try workspace_mod.Workspace.init(gpa, io, primary),
             .input = .init(gpa),
             .palette_input = .init(gpa),
             .comment_input = .init(gpa),
@@ -331,14 +302,14 @@ pub const App = struct {
         const manager = try gpa.create(background_mod.BackgroundManager);
         errdefer gpa.destroy(manager);
         manager.* = .init(io, gpa);
-        app.background = manager;
+        app.ws.background = manager;
         runtime.agent.background_manager = manager;
         // Materialize the project-scoped Python helper package (`.nova/`) so the
         // model's `uv run --project .nova` invocations find it. Best-effort —
         // a failure only degrades the python workflow, never blocks startup.
         pytools.ensureInstalled(gpa, io, runtime.agent.cwd) catch {};
-        app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
-        app.thread.id = runtime.session_writer.session.id;
+        app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
+        app.ws.active.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
             (runtime.hasCodexClient() or tui_provider.detectCodexSignIn(gpa, io, runtime.home_dir));
         app.cached_config = config;
@@ -347,26 +318,10 @@ pub const App = struct {
     }
 
     /// The live lane's runtime, or null when no engine is attached (idle/test).
-    /// Engine ownership lives in `thread.engine`; this read accessor replaced the
-    /// former `App.runtime` field.
+    /// Thin read accessor over the workspace, kept because the draw and input
+    /// paths reach for it constantly.
     fn liveRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
-        return switch (self.thread.engine) {
-            .live => |live| live.runtime,
-            .idle => null,
-        };
-    }
-
-    /// The runtime whose allocator, home dir, and prompt/skills template seed
-    /// new lanes: the first live lane (the primary, in practice). Null only in
-    /// headless/test setups.
-    fn templateRuntime(self: *const App) ?*runtime_mod.AgentRuntime {
-        for (self.threads.items) |lane| {
-            switch (lane.engine) {
-                .live => |live| return live.runtime,
-                else => {},
-            }
-        }
-        return null;
+        return self.ws.liveRuntime();
     }
 
     pub fn bindInputCallbacks(self: *App) void {
@@ -377,27 +332,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        // Cancel every lane's in-flight turn (background lanes may still be
-        // running) so no worker thread outlives the App.
-        for (self.threads.items) |lane| {
-            if (lane.turn_future) |*future| {
-                if (lane.worker_context) |*worker| worker.requestCancel();
-                _ = future.cancel(self.io);
-                lane.turn_future = null;
-            }
-            self.cancelLaneNaming(lane);
-        }
-        // Now that no worker can still be inside `manager.start`, terminate and
-        // join every background job (kills the whole process tree on Windows via
-        // the per-job Job Object). Jobs hold an opaque owner token that is never
-        // dereferenced, so this is independent of lane/agent teardown order.
-        if (self.background) |manager| {
-            manager.deinit();
-            self.gpa.destroy(manager);
-            self.background = null;
-        }
-        for (self.background_pending.items) |*delivery| self.freeDelivery(delivery);
-        self.background_pending.deinit(self.gpa);
+        self.ws.deinit();
         // Cancel the in-flight load first (it needs `io`), then free the
         // catalogue's owned lists + error in one pass.
         self.cancelModelLoad();
@@ -422,11 +357,6 @@ pub const App = struct {
         self.closeAtSearch();
         self.at_results.deinit(self.gpa);
         self.clearLanesState();
-        for (self.threads.items) |lane| {
-            lane.deinit(self.gpa);
-            self.gpa.destroy(lane);
-        }
-        self.threads.deinit(self.gpa);
         self.diff.deinit(self.gpa);
         self.input.deinit();
         self.palette_input.deinit();
@@ -435,21 +365,21 @@ pub const App = struct {
     }
 
     fn awaitTurn(self: *App) void {
-        if (self.thread.turn_future) |*future| {
+        if (self.ws.active.turn_future) |*future| {
             future.await(self.io);
-            self.thread.turn_future = null;
+            self.ws.active.turn_future = null;
         }
     }
 
     pub fn handleInterrupt(self: *App) !void {
-        if (self.thread.turn.state != .active) return;
-        self.thread.worker_context.?.requestCancel();
+        if (self.ws.active.turn.state != .active) return;
+        self.ws.active.worker_context.?.requestCancel();
         // Show the cancellation notice immediately.
         const message = try self.gpa.dupe(u8, agent_worker.cancel_message);
         var event: agent_mod.Agent.Event = .{ .turn_failed = message };
         defer event.deinit(self.gpa);
-        _ = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
-        self.thread.turn.interrupt();
+        _ = try self.ws.active.turn_view.apply(self.gpa, &self.ws.active.transcript, event);
+        self.ws.active.turn.interrupt();
         // Tear the worker down now rather than waiting for it to reach its next
         // cooperative cancellation point. `requestCancel` only takes effect on
         // the worker's next `emit`, but between stream chunks (and for the whole
@@ -463,27 +393,27 @@ pub const App = struct {
     }
 
     fn discardAbandonedTurn(self: *App) void {
-        if (self.thread.turn.state != .interrupting and self.thread.turn_future == null) return;
-        if (self.thread.turn_future) |*future| {
+        if (self.ws.active.turn.state != .interrupting and self.ws.active.turn_future == null) return;
+        if (self.ws.active.turn_future) |*future| {
             // `cancel` blocks until the task hits its next cancellation point
             // (typically the network read) and unwinds. On a healthy stream
             // this is near-instant; on a hung connection it forces the OS
             // read to abort.
             _ = future.cancel(self.io);
-            self.thread.turn_future = null;
+            self.ws.active.turn_future = null;
         }
         var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
-        defer batch.deinit(self.thread.worker_context.?.gpa);
-        self.thread.worker_context.?.queue.drainInto(
-            self.thread.worker_context.?.io,
-            self.thread.worker_context.?.gpa,
+        defer batch.deinit(self.ws.active.worker_context.?.gpa);
+        self.ws.active.worker_context.?.queue.drainInto(
+            self.ws.active.worker_context.?.io,
+            self.ws.active.worker_context.?.gpa,
             &batch,
         ) catch {};
         for (batch.items) |event_ptr| {
-            event_ptr.deinit(self.thread.worker_context.?.gpa);
-            self.thread.worker_context.?.gpa.destroy(event_ptr);
+            event_ptr.deinit(self.ws.active.worker_context.?.gpa);
+            self.ws.active.worker_context.?.gpa.destroy(event_ptr);
         }
-        if (self.thread.turn.state == .interrupting) self.thread.turn.reset();
+        if (self.ws.active.turn.state == .interrupting) self.ws.active.turn.reset();
     }
 
     /// Start a turn from the current input. Returns true when a turn was
@@ -495,44 +425,44 @@ pub const App = struct {
         // If a previous turn was Esc-interrupted, force-cancel its worker
         // before starting a new one. Two concurrent workers would race on
         // the shared agent message history.
-        if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
-        if (self.thread.turn.isActive()) return try self.enqueueSubmit();
+        if (self.ws.active.turn.state == .interrupting) self.discardAbandonedTurn();
+        if (self.ws.active.turn.isActive()) return try self.enqueueSubmit();
         const prompt = try self.input.toOwnedSlice();
         defer self.gpa.free(prompt);
         if (prompt.len == 0) return false;
 
         if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
-            _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
+            _ = try self.ws.active.transcript.append(self.gpa, .user, "you", prompt);
             const message = try self.formatNoProviderMessage();
             defer self.gpa.free(message);
-            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+            _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", message);
             return false;
         }
 
         self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        _ = try self.thread.transcript.append(self.gpa, .user, "you", prompt);
+        self.ws.active.worker_context.?.resetCancel();
+        _ = try self.ws.active.transcript.append(self.gpa, .user, "you", prompt);
         // A worktree lane's first prompt also names its branch: ask the model
         // in parallel, and rename the hex branch when the answer lands.
-        if (self.thread.title == null and workingLaneOf(self.thread) != null) {
-            self.scheduleLaneNaming(self.thread, prompt) catch {};
+        if (self.ws.active.title == null and workingLaneOf(self.ws.active) != null) {
+            self.ws.scheduleNaming(self.ws.active, prompt) catch {};
         }
         try self.setLaneTitleIfUnset(prompt);
         try self.appendSkillInvocationsToTranscript(prompt);
-        self.thread.turn_view.awaitModel();
+        self.ws.active.turn_view.awaitModel();
         // The worker expands `@`-mentions (reading files / images) off the UI
         // thread; stash the raw text for `startTurn` to hand over. The worker
         // owns and frees it, so it must be allocated with the worker's
         // allocator (`worker_context.gpa`), not `self.gpa`.
-        self.thread.pending_prompt = try self.thread.worker_context.?.gpa.dupe(u8, prompt);
-        self.thread.turn.submit();
+        self.ws.active.pending_prompt = try self.ws.active.worker_context.?.gpa.dupe(u8, prompt);
+        self.ws.active.turn.submit();
         return true;
     }
 
     /// Label the lane by its first user prompt (one line, truncated) so split
     /// tiles read as the session, not a generic "lane". Owned; freed in deinit.
     fn setLaneTitleIfUnset(self: *App, prompt: []const u8) !void {
-        if (self.thread.title != null) return;
+        if (self.ws.active.title != null) return;
         const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
         if (trimmed.len == 0) return;
         const line_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
@@ -540,12 +470,12 @@ pub const App = struct {
         if (line.len == 0) return;
         const max: usize = 40;
         if (line.len <= max) {
-            self.thread.title = try self.gpa.dupe(u8, line);
+            self.ws.active.title = try self.gpa.dupe(u8, line);
             return;
         }
         var cut: usize = max;
         while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
-        self.thread.title = try std.fmt.allocPrint(self.gpa, "{s}…", .{line[0..cut]});
+        self.ws.active.title = try std.fmt.allocPrint(self.gpa, "{s}…", .{line[0..cut]});
     }
 
     fn formatNoProviderMessage(self: *App) ![]u8 {
@@ -587,7 +517,7 @@ pub const App = struct {
     }
 
     fn resetTurnState(self: *App) void {
-        self.thread.turn_view.reset(self.io);
+        self.ws.active.turn_view.reset(self.io);
         self.loading_frame = 0;
         // Leave `transcript_auto_scroll` alone — if the user has scrolled away
         // from the tail to read older context, submitting another message
@@ -596,12 +526,12 @@ pub const App = struct {
     }
 
     pub fn startTurn(self: *App) !void {
-        const prompt = self.thread.pending_prompt;
-        self.thread.pending_prompt = null;
-        errdefer if (prompt) |p| self.thread.worker_context.?.gpa.free(p);
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
+        const prompt = self.ws.active.pending_prompt;
+        self.ws.active.pending_prompt = null;
+        errdefer if (prompt) |p| self.ws.active.worker_context.?.gpa.free(p);
+        self.ws.active.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.ws.active.agent.?,
+            &self.ws.active.worker_context.?,
             prompt,
             false,
         });
@@ -612,87 +542,26 @@ pub const App = struct {
     /// queue into history (leading messages as context, the last as the latest
     /// user message the model answers). Returns true if a turn was started.
     fn restartTurnForQueuedMessages(self: *App) !bool {
-        if (self.thread.queued.items.len == 0) return false;
+        if (self.ws.active.queued.items.len == 0) return false;
         // No connected provider to run a turn: surface the queued text in the
         // transcript and drop the queue rather than spin up a doomed worker.
         if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
-            try self.flushQueuedUserMessagesToTranscript(@intCast(self.thread.queued.items.len));
-            self.thread.agent.?.clearQueue();
+            try self.flushQueuedUserMessagesToTranscript(@intCast(self.ws.active.queued.items.len));
+            self.ws.active.agent.?.clearQueue();
             return true;
         }
         self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        self.thread.turn_view.awaitModel();
-        self.thread.pending_prompt = null;
-        self.thread.turn.submit();
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
-            self.thread.pending_prompt,
+        self.ws.active.worker_context.?.resetCancel();
+        self.ws.active.turn_view.awaitModel();
+        self.ws.active.pending_prompt = null;
+        self.ws.active.turn.submit();
+        self.ws.active.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.ws.active.agent.?,
+            &self.ws.active.worker_context.?,
+            self.ws.active.pending_prompt,
             true,
         });
         return true;
-    }
-
-    /// The lane whose agent is `agent_ptr`, or null if it has been closed. Used
-    /// to route a background-job completion back to the lane that started it.
-    fn laneForAgent(self: *App, agent_ptr: *agent_mod.Agent) ?*Thread {
-        for (self.threads.items) |lane| {
-            if (lane.agent) |a| {
-                if (a == agent_ptr) return lane;
-            }
-        }
-        return null;
-    }
-
-    fn freeDelivery(self: *App, delivery: *BackgroundDelivery) void {
-        self.gpa.free(delivery.notice);
-        if (delivery.message) |message| self.gpa.free(message);
-        delivery.* = undefined;
-    }
-
-    /// Whether the drain/animation tick must stay alive for background work:
-    /// jobs still running, or completions waiting to be delivered.
-    fn backgroundActive(self: *App) bool {
-        if (self.background_pending.items.len > 0) return true;
-        const manager = self.background orelse return false;
-        return manager.activeCount() > 0;
-    }
-
-    /// Drain finished jobs from the manager into `background_pending`. Called each
-    /// tick; the actual delivery (notice + turn) happens in
-    /// `deliverPendingBackground` once the owning lane is idle.
-    fn pollBackgroundJobs(self: *App) !bool {
-        const manager = self.background orelse return false;
-        const finished = manager.takeFinished(self.gpa) catch return false;
-        defer self.gpa.free(finished);
-        for (finished) |*job| {
-            const notice = self.formatBackgroundNotice(job) catch {
-                job.deinit(self.gpa);
-                continue;
-            };
-            // Take the model-facing message out of the job so its deinit only
-            // frees the metadata.
-            const message = job.completion_message;
-            job.completion_message = null;
-            self.background_pending.append(self.gpa, .{
-                .owner = job.owner,
-                .notice = notice,
-                .message = message,
-            }) catch {
-                self.gpa.free(notice);
-                if (message) |m| self.gpa.free(m);
-            };
-            job.deinit(self.gpa);
-        }
-        return finished.len > 0;
-    }
-
-    fn formatBackgroundNotice(self: *App, job: *const background_mod.BackgroundManager.Finished) ![]u8 {
-        if (job.killed) {
-            return std.fmt.allocPrint(self.gpa, "{s} ({s}) was cancelled", .{ job.label, job.command });
-        }
-        return std.fmt.allocPrint(self.gpa, "{s} ({s}) finished — exit {d}", .{ job.label, job.command, job.exit_code });
     }
 
     /// Deliver buffered background completions to idle lanes: append the notice
@@ -700,16 +569,26 @@ pub const App = struct {
     /// message and start a turn to answer it. A lane mid-turn is left alone (the
     /// completion waits); the visible lane is also left alone while the user is
     /// typing, so a finishing job never yanks them mid-compose.
+    /// The human-facing one-liner for a finished background job. Wording lives
+    /// here, not in the workspace — the workspace only decides which lane the
+    /// completion belongs to and when it may land.
+    fn formatBackgroundNotice(self: *App, delivery: *const workspace_mod.Delivery) ![]u8 {
+        if (delivery.killed) {
+            return std.fmt.allocPrint(self.gpa, "{s} ({s}) was cancelled", .{ delivery.label, delivery.command });
+        }
+        return std.fmt.allocPrint(self.gpa, "{s} ({s}) finished — exit {d}", .{ delivery.label, delivery.command, delivery.exit_code });
+    }
+
     fn deliverPendingBackground(self: *App) !bool {
         var changed = false;
-        const active = self.thread;
-        defer self.thread = active;
+        const active = self.ws.active;
+        defer self.ws.active = active;
         var i: usize = 0;
-        while (i < self.background_pending.items.len) {
-            const delivery = &self.background_pending.items[i];
-            const lane = self.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
-                self.freeDelivery(delivery);
-                _ = self.background_pending.orderedRemove(i);
+        while (i < self.ws.background_pending.items.len) {
+            const delivery = &self.ws.background_pending.items[i];
+            const lane = self.ws.laneForAgent(@ptrCast(@alignCast(delivery.owner))) orelse {
+                self.ws.freeDelivery(delivery);
+                _ = self.ws.background_pending.orderedRemove(i);
                 continue;
             };
             const composing = lane == active and self.input.buf.realLength() > 0;
@@ -717,14 +596,17 @@ pub const App = struct {
                 i += 1;
                 continue;
             }
-            _ = lane.transcript.append(self.gpa, .notice, "background", delivery.notice) catch {};
+            if (self.formatBackgroundNotice(delivery)) |notice| {
+                defer self.gpa.free(notice);
+                _ = lane.transcript.append(self.gpa, .notice, "background", notice) catch {};
+            } else |_| {}
             if (lane == active) changed = true;
             const start_turn = delivery.message != null;
             if (delivery.message) |message| lane.agent.?.enqueueRaw(message) catch {};
-            self.freeDelivery(delivery);
-            _ = self.background_pending.orderedRemove(i);
+            self.ws.freeDelivery(delivery);
+            _ = self.ws.background_pending.orderedRemove(i);
             if (start_turn) {
-                self.thread = lane;
+                self.ws.active = lane;
                 self.startDeliveryTurnOnCurrentThread() catch {};
                 return true;
             }
@@ -734,32 +616,32 @@ pub const App = struct {
         return changed;
     }
 
-    /// Start a turn on `self.thread` that drains its agent's queued (background)
+    /// Start a turn on `self.ws.active` that drains its agent's queued (background)
     /// messages into history and answers them. Mirrors
     /// `restartTurnForQueuedMessages` but is gated on the agent queue, not the
-    /// UI's display queue. Caller must have set `self.thread` to the target lane.
+    /// UI's display queue. Caller must have set `self.ws.active` to the target lane.
     fn startDeliveryTurnOnCurrentThread(self: *App) !void {
         if (self.liveRuntime() != null and self.liveRuntime().?.client == .none) {
             // No provider to run a turn — drop the queued notice rather than spin
             // up a doomed worker.
-            self.thread.agent.?.clearQueue();
+            self.ws.active.agent.?.clearQueue();
             return;
         }
         self.resetTurnState();
-        self.thread.worker_context.?.resetCancel();
-        self.thread.turn_view.awaitModel();
-        self.thread.pending_prompt = null;
-        self.thread.turn.submit();
-        self.thread.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
-            self.thread.agent.?,
-            &self.thread.worker_context.?,
-            self.thread.pending_prompt,
+        self.ws.active.worker_context.?.resetCancel();
+        self.ws.active.turn_view.awaitModel();
+        self.ws.active.pending_prompt = null;
+        self.ws.active.turn.submit();
+        self.ws.active.turn_future = try self.io.concurrent(agent_worker.runAgentTurn, .{
+            self.ws.active.agent.?,
+            &self.ws.active.worker_context.?,
+            self.ws.active.pending_prompt,
             true,
         });
     }
 
     fn runningBackgroundCount(self: *App) usize {
-        const manager = self.background orelse return 0;
+        const manager = self.ws.background orelse return 0;
         return manager.runningCount();
     }
 
@@ -803,13 +685,15 @@ pub const App = struct {
         return false;
     }
 
+    /// Cancel the job under the modal's cursor. The cursor is resolved to a job
+    /// id here, against the same snapshot the modal draws from, so the workspace
+    /// never sees a selection index.
     fn cancelSelectedBackgroundJob(self: *App) void {
-        const manager = self.background orelse return;
+        const manager = self.ws.background orelse return;
         const views = manager.snapshot(self.gpa) catch return;
         defer background_mod.BackgroundManager.freeViews(self.gpa, views);
         if (views.len == 0) return;
-        const sel = @min(self.background_selection, views.len - 1);
-        _ = manager.cancel(views[sel].id);
+        _ = self.ws.cancelBackgroundJob(views[@min(self.background_selection, views.len - 1)].id);
         self.background_cancel_focus = false;
     }
 
@@ -825,29 +709,29 @@ pub const App = struct {
     }
 
     fn permissionPending(self: *App) bool {
-        const worker = if (self.thread.worker_context) |*context| context else return false;
+        const worker = if (self.ws.active.worker_context) |*context| context else return false;
         return worker.approval.pending(worker.io);
     }
 
     fn handlePermissionKey(self: *App, key: vaxis.Key) !bool {
         if (key.matches(vaxis.Key.left, .{})) {
-            self.thread.permission_selection = .approve;
+            self.ws.active.permission_selection = .approve;
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            self.thread.permission_selection = .reject;
+            self.ws.active.permission_selection = .reject;
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
-            if (self.thread.permission_scroll > 0) self.thread.permission_scroll -= 1;
+            if (self.ws.active.permission_scroll > 0) self.ws.active.permission_scroll -= 1;
             return true;
         }
         if (key.matches(vaxis.Key.down, .{})) {
-            self.thread.permission_scroll += 1;
+            self.ws.active.permission_scroll += 1;
             return true;
         }
         if (key.matches(vaxis.Key.enter, .{})) {
-            try self.resolvePermission(self.thread.permission_selection);
+            try self.resolvePermission(self.ws.active.permission_selection);
             return true;
         }
         if (key.matches('y', .{}) or key.matches('a', .{})) {
@@ -862,14 +746,14 @@ pub const App = struct {
     }
 
     fn resolvePermission(self: *App, decision: agent_worker.ApprovalDecision) !void {
-        const worker = if (self.thread.worker_context) |*context| context else return;
+        const worker = if (self.ws.active.worker_context) |*context| context else return;
         try worker.approval.resolve(worker.io, decision);
-        self.thread.permission_scroll = 0;
-        self.thread.permission_selection = .approve;
+        self.ws.active.permission_scroll = 0;
+        self.ws.active.permission_selection = .approve;
     }
 
     pub fn applyAgentEvent(self: *App, event: agent_mod.Agent.Event) !bool {
-        const outcome = self.thread.turn.apply(event);
+        const outcome = self.ws.active.turn.apply(event);
         if (!outcome.project) {
             // Interrupting: a discarded turn's output must not mutate the
             // transcript. Join the worker once it posts its terminal event, then
@@ -885,10 +769,10 @@ pub const App = struct {
             }
             return false;
         }
-        var visible_change = try self.thread.turn_view.apply(self.gpa, &self.thread.transcript, event);
+        var visible_change = try self.ws.active.turn_view.apply(self.gpa, &self.ws.active.transcript, event);
         switch (event) {
             .queued_messages_flushed => |count| {
-                if (count > 0 and self.thread.queued.items.len > 0) {
+                if (count > 0 and self.ws.active.queued.items.len > 0) {
                     try self.flushQueuedUserMessagesToTranscript(count);
                     visible_change = true;
                 }
@@ -898,39 +782,12 @@ pub const App = struct {
         if (outcome.finished) {
             self.awaitTurn();
             self.checkpointFinishedTurn();
-            if (self.thread.queued.items.len > 0) {
+            if (self.ws.active.queued.items.len > 0) {
                 self.clearQueuedUserMessages();
                 visible_change = true;
             }
         }
         return visible_change;
-    }
-
-    /// What a `sealCheckpoint` attempt did — so callers can tell a genuine
-    /// failure apart from the benign "nothing to bind" and "git unavailable"
-    /// cases and surface only the former.
-    const SealOutcome = enum { sealed, nothing, unavailable, failed };
-
-    /// Snapshot the working tree (git-shadow) and bind the resulting commit id to
-    /// the active conversation leaf, so navigating back here restores this code
-    /// state. HEAD stays attached to the branch; the snapshot is an off-branch
-    /// commit kept alive by a `refs/nova/*` ref. A git or persistence error
-    /// returns `.failed` — never swallowed silently, since a missing binding is
-    /// exactly what broke timeline navigation before.
-    fn sealCheckpoint(self: *App) SealOutcome {
-        const rt = self.liveRuntime() orelse return .unavailable;
-        if (!self.ensureCheckpointReady()) return .unavailable;
-        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return .failed;
-        defer self.gpa.free(index);
-        const sha = vcs.snapshot(self.gpa, self.io, rt.cwd, index) catch return .failed;
-        rt.session_writer.setLeafSnapshot(sha.slice()) catch return .failed;
-        // Bind only makes sense if there is a leaf entry to bind to; otherwise the
-        // snapshot is an orphan (gc'd later) — report nothing happened.
-        const leaf_id = rt.session_writer.leaf() orelse return .nothing;
-        // Keep the snapshot reachable against `git gc`, named by the entry it
-        // binds so it can be pruned with that entry.
-        vcs.keepRef(self.gpa, self.io, rt.cwd, leaf_id, sha) catch {};
-        return .sealed;
     }
 
     /// Tell the user a snapshot couldn't be taken — once. A persistently broken
@@ -939,7 +796,7 @@ pub const App = struct {
     fn noteCheckpointFailure(self: *App) void {
         if (self.checkpoint_warned) return;
         self.checkpoint_warned = true;
-        _ = self.thread.transcript.append(self.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
+        _ = self.ws.active.transcript.append(self.gpa, .notice, "notice", "Couldn't snapshot the working tree — timeline navigation may not restore this point's files. Check that `git` works in this repo.") catch {};
     }
 
     fn noteCheckpointSucceeded(self: *App) void {
@@ -947,13 +804,15 @@ pub const App = struct {
     }
 
     /// Snapshot at a turn boundary and surface a genuine failure to the user
-    /// (deduped). Every place that must bind the current code state to the
-    /// conversation goes through here, so a broken snapshot is never silent.
+    /// (deduped). The snapshot itself is the agent's — the same call the tool
+    /// loop makes after every batch — so a turn-boundary checkpoint and a
+    /// per-batch one share one implementation and one dedup state. An unchanged
+    /// working tree is a no-op here, not a new node.
     fn checkpointBoundary(self: *App) void {
-        switch (self.sealCheckpoint()) {
+        switch (self.ws.checkpoint()) {
             .sealed => self.noteCheckpointSucceeded(),
             .failed => self.noteCheckpointFailure(),
-            .nothing, .unavailable => {},
+            .unchanged, .no_leaf, .unavailable => {},
         }
     }
 
@@ -967,11 +826,11 @@ pub const App = struct {
     /// otherwise open the commit-message prompt. `saveActiveLane` commits on
     /// confirm.
     fn beginSave(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
+        if (self.liveRuntime() == null) return error.NoActiveRuntime;
 
-        if (!(vcs.workingTreeDirty(self.gpa, self.io, rt.cwd) catch true)) {
-            _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "Nothing to save — the working tree matches the last commit.");
+        if (!self.ws.activeLaneDirty()) {
+            _ = try self.ws.active.transcript.append(self.gpa, .notice, "notice", "Nothing to save — the working tree matches the last commit.");
             return;
         }
 
@@ -980,36 +839,14 @@ pub const App = struct {
         self.mode = .save_message;
         self.clearInput();
         self.clearPaletteInput();
-        if (self.thread.title) |title| self.palette_input.insertSliceAtCursor(title) catch {};
+        if (self.ws.active.title) |title| self.palette_input.insertSliceAtCursor(title) catch {};
     }
 
-    /// `/save`: commit the current working tree onto the lane's branch with the
-    /// user's message. In the git-shadow model HEAD stays attached, so this is
-    /// just `git add -A && git commit` — the working tree *is* the state to keep;
-    /// the off-branch snapshot chain never reaches the branch. `message` is the
-    /// user-supplied commit message (see `beginSave`).
+    /// `/save`: commit the active lane's working tree with the user's message
+    /// (see `beginSave`), then confirm it in the transcript.
     fn saveActiveLane(self: *App, message: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        try vcs.commitAll(self.gpa, self.io, rt.cwd, message);
-        _ = try self.thread.transcript.append(self.gpa, .success, "notice", "Saved — committed the working tree to the current branch.");
-    }
-
-    /// Resolve once whether the git-shadow snapshot feature can run: git
-    /// installed and the working copy inside a git repo. Cached per session.
-    fn ensureCheckpointReady(self: *App) bool {
-        switch (self.checkpoint_state) {
-            .ready => return true,
-            .unavailable => return false,
-            .unknown => {},
-        }
-        const repo = self.repoRoot() orelse {
-            self.checkpoint_state = .unavailable;
-            return false;
-        };
-        const ok = vcs.isAvailable(self.gpa, self.io) and vcs.isRepo(self.gpa, self.io, repo);
-        self.checkpoint_state = if (ok) .ready else .unavailable;
-        return ok;
+        try self.ws.saveActiveLane(message);
+        _ = try self.ws.active.transcript.append(self.gpa, .success, "notice", "Saved — committed the working tree to the current branch.");
     }
 
     pub fn handleCommandKey(self: *App, key: vaxis.Key) !bool {
@@ -1176,15 +1013,15 @@ pub const App = struct {
             // re-enters the input and traps the cursor there again.
             if (self.block_nav and self.selectionIsLastMessage() and !self.selectedMessageCanScrollDown()) {
                 self.block_nav = false;
-                self.thread.auto_scroll = true;
+                self.ws.active.auto_scroll = true;
                 _ = try self.moveInputCursorVertical(.down);
                 return true;
             }
             const scrolled = self.navigateTranscript(.next);
-            self.thread.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
+            self.ws.active.auto_scroll = !scrolled and self.selectionIsLastMessage() and !self.selectedMessageIsLong();
             return true;
         }
-        if (self.threads.items.len > 1) {
+        if (self.ws.lanes.items.len > 1) {
             if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.right, .{ .shift = true })) {
                 self.cycleLane(1);
                 return true;
@@ -1195,7 +1032,7 @@ pub const App = struct {
             }
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            self.thread.transcript.toggleSelected();
+            self.ws.active.transcript.toggleSelected();
             return true;
         }
         return false;
@@ -1425,7 +1262,7 @@ pub const App = struct {
     }
 
     fn openTimelineSelector(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         self.mode = .tree_picker;
         self.clearInput();
         try self.reloadTreeNodes();
@@ -1444,7 +1281,7 @@ pub const App = struct {
             if (state.isEmpty()) {
                 state.deinit(self.gpa);
                 self.mode = .normal;
-                _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
+                _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
                 return;
             }
             self.diff.deinit(self.gpa);
@@ -1473,7 +1310,7 @@ pub const App = struct {
     fn reportDiffError(self: *App, err: anyerror) !void {
         const message = try std.fmt.allocPrint(self.gpa, "Couldn't open diff: {s}", .{@errorName(err)});
         defer self.gpa.free(message);
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", message);
         self.mode = .normal;
         self.clearInput();
         self.clearPaletteInput();
@@ -1775,7 +1612,7 @@ pub const App = struct {
     }
 
     fn connectCodex(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         var credentials = try codex.login(self.gpa, self.io, self.liveRuntime().?.home_dir);
         defer credentials.deinit(self.gpa);
         self.models.models_cached = false;
@@ -1788,23 +1625,23 @@ pub const App = struct {
         try self.persistModelSelection(.openai, model.id, effort, .global);
         self.mode = .normal;
         self.clearInput();
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", "Connected to OpenAI Codex.");
     }
 
     fn signOutCodex(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         // The naming client is about to be freed; no job may still borrow it.
-        self.cancelLaneNaming(self.thread);
+        self.ws.cancelNaming(self.ws.active);
         try codex.signOut(self.gpa, self.io, self.liveRuntime().?.home_dir);
         self.liveRuntime().?.disconnectCodexClient();
         self.codex_signed_in = false;
         self.liveRuntime().?.codex_connection_expired = false;
-        self.thread.agent.?.client = self.liveRuntime().?.client;
+        self.ws.active.agent.?.client = self.liveRuntime().?.client;
         self.codexModelsClear();
         self.models.models_cached = false;
         self.mode = .normal;
         self.clearInput();
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", "Signed out from OpenAI Codex.");
     }
 
     /// Save the entered API key for a catalogue provider, then fetch just that
@@ -1812,7 +1649,7 @@ pub const App = struct {
     /// the model picker. A blank key is allowed only for providers that don't
     /// require one (`requiresApiKey() == false`); all current ones do.
     fn submitProviderSetup(self: *App, provider: config_mod.Provider) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         const key = std.mem.trim(u8, self.provider_key_input.items, " \t\r\n");
 
         // A required key cannot be blank — keep the form open so the user can type.
@@ -1887,8 +1724,8 @@ pub const App = struct {
     }
 
     fn applySelectedModel(self: *App) !void {
-        if (self.thread.turn.state == .interrupting) self.discardAbandonedTurn();
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.state == .interrupting) self.discardAbandonedTurn();
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         const model = self.selectedCodexModel() orelse return error.NoModels;
         const effort = self.selectedReasoningEffort();
 
@@ -2259,9 +2096,9 @@ pub const App = struct {
         effort: ai.ReasoningEffort,
     ) !void {
         // The naming client is about to be replaced; no job may still borrow it.
-        self.cancelLaneNaming(self.thread);
+        self.ws.cancelNaming(self.ws.active);
         try self.liveRuntime().?.connectCodexClient(credentials, model, effort);
-        self.thread.agent.?.client = self.liveRuntime().?.client;
+        self.ws.active.agent.?.client = self.liveRuntime().?.client;
     }
 
     fn attachOpenAiCompatibleClient(
@@ -2272,9 +2109,9 @@ pub const App = struct {
         effort: ai.ReasoningEffort,
     ) !void {
         // The naming client is about to be replaced; no job may still borrow it.
-        self.cancelLaneNaming(self.thread);
+        self.ws.cancelNaming(self.ws.active);
         try self.liveRuntime().?.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
-        self.thread.agent.?.client = self.liveRuntime().?.client;
+        self.ws.active.agent.?.client = self.liveRuntime().?.client;
     }
 
     fn reloadResumeSessions(self: *App) !void {
@@ -2356,28 +2193,8 @@ pub const App = struct {
     /// conversation, the display transcript, AND the working copy from the new
     /// branch. Refused mid-turn.
     fn navigateToEntry(self: *App, entry_id: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const rt = self.liveRuntime() orelse return error.NoActiveRuntime;
-        try rt.session_writer.navigate(entry_id);
-        try rt.reloadMessages();
+        try self.ws.navigateToEntry(entry_id);
         try self.rebuildTranscriptFromAgent();
-        try self.restoreCheckpointForBranch(rt);
-    }
-
-    /// Restore the working tree to the snapshot bound to the now-active timeline
-    /// node — its own, or the nearest ancestor that has one (`snapshotAt`). HEAD
-    /// stays attached to the branch; `vcs.restore` rewrites tracked files to that
-    /// tree (adds/modifies/deletes). Best-effort: a node with no bound snapshot
-    /// (an early point, before any file change) or a git failure simply leaves
-    /// the working tree as-is — no error, since the binding is reliable and the
-    /// "no snapshot here" case is normal, not a problem.
-    fn restoreCheckpointForBranch(self: *App, rt: *runtime_mod.AgentRuntime) !void {
-        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
-        defer self.gpa.free(sha_raw);
-        const sha = vcs.ObjectId.parse(sha_raw) catch return;
-        const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return;
-        defer self.gpa.free(index);
-        vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
     }
 
     fn clearInput(self: *App) void {
@@ -2511,7 +2328,7 @@ pub const App = struct {
         }
         // Enqueue the raw text; the worker expands `@`-mentions when it drains
         // the queue, keeping file I/O off the UI thread.
-        self.thread.agent.?.enqueueUser(prompt) catch |err| switch (err) {
+        self.ws.active.agent.?.enqueueUser(prompt) catch |err| switch (err) {
             error.QueueFull => {
                 self.gpa.free(prompt);
                 try self.appendMessageQueueFullNotice();
@@ -2519,23 +2336,23 @@ pub const App = struct {
             },
             else => return err,
         };
-        try self.thread.queued.append(self.gpa, .{ .text = prompt });
+        try self.ws.active.queued.append(self.gpa, .{ .text = prompt });
         // Select the newest message so the line above the input shows what was
         // just queued; ALT+← walks back to older ones.
-        self.queued_selection = self.thread.queued.items.len - 1;
+        self.queued_selection = self.ws.active.queued.items.len - 1;
         self.clearInput();
         return false;
     }
 
     /// Move the queued-message selection one older (ALT+←).
     fn selectPrevQueued(self: *App) void {
-        if (self.thread.queued.items.len == 0) return;
+        if (self.ws.active.queued.items.len == 0) return;
         if (self.queued_selection > 0) self.queued_selection -= 1;
     }
 
     /// Move the queued-message selection one newer (ALT+→).
     fn selectNextQueued(self: *App) void {
-        const len = self.thread.queued.items.len;
+        const len = self.ws.active.queued.items.len;
         if (len == 0) return;
         if (self.queued_selection + 1 < len) self.queued_selection += 1;
     }
@@ -2544,17 +2361,17 @@ pub const App = struct {
     /// injected after the next tool batch. Updates both the UI mirror and the
     /// agent queue so the worker's drain decision matches what's on screen.
     fn steerSelectedQueued(self: *App) void {
-        const items = self.thread.queued.items;
+        const items = self.ws.active.queued.items;
         if (items.len == 0) return;
         const index = @min(self.queued_selection, items.len - 1);
         items[index].steer = true;
-        self.thread.agent.?.setQueuedSteer(@intCast(index));
+        self.ws.active.agent.?.setQueuedSteer(@intCast(index));
     }
 
     fn appendMessageQueueFullNotice(self: *App) !void {
         // The spinner is derived from the turn view and drawn outside the
         // transcript, so appending needs no remove/re-append dance.
-        _ = try self.thread.transcript.append(self.gpa, .notice, "notice", "MessageQueueFull");
+        _ = try self.ws.active.transcript.append(self.gpa, .notice, "notice", "MessageQueueFull");
     }
 
     fn appendSkillInvocationsToTranscript(self: *App, prompt: []const u8) !void {
@@ -2564,27 +2381,27 @@ pub const App = struct {
         for (names) |name| {
             const title = try std.fmt.allocPrint(self.gpa, "[SKILL] {s}", .{name});
             defer self.gpa.free(title);
-            _ = try self.thread.transcript.append(self.gpa, .skill, title, "");
+            _ = try self.ws.active.transcript.append(self.gpa, .skill, title, "");
         }
     }
 
     fn flushQueuedUserMessagesToTranscript(self: *App, count: u32) !void {
-        const flush_count: usize = @min(count, self.thread.queued.items.len);
-        for (self.thread.queued.items[0..flush_count]) |message| {
-            _ = try self.thread.transcript.append(self.gpa, .user, "you", message.text);
+        const flush_count: usize = @min(count, self.ws.active.queued.items.len);
+        for (self.ws.active.queued.items[0..flush_count]) |message| {
+            _ = try self.ws.active.transcript.append(self.gpa, .user, "you", message.text);
             try self.appendSkillInvocationsToTranscript(message.text);
             self.gpa.free(message.text);
         }
-        std.mem.copyForwards(Thread.QueuedMessage, self.thread.queued.items[0 .. self.thread.queued.items.len - flush_count], self.thread.queued.items[flush_count..]);
-        self.thread.queued.shrinkRetainingCapacity(self.thread.queued.items.len - flush_count);
+        std.mem.copyForwards(Thread.QueuedMessage, self.ws.active.queued.items[0 .. self.ws.active.queued.items.len - flush_count], self.ws.active.queued.items[flush_count..]);
+        self.ws.active.queued.shrinkRetainingCapacity(self.ws.active.queued.items.len - flush_count);
         // Messages drain from the front, so shift the selection left to keep it
         // pointing at the same logical message (clamped into range).
         self.queued_selection -|= flush_count;
     }
 
     fn clearQueuedUserMessages(self: *App) void {
-        for (self.thread.queued.items) |message| self.gpa.free(message.text);
-        self.thread.queued.clearRetainingCapacity();
+        for (self.ws.active.queued.items) |message| self.gpa.free(message.text);
+        self.ws.active.queued.clearRetainingCapacity();
         self.queued_selection = 0;
     }
 
@@ -2615,7 +2432,7 @@ pub const App = struct {
         self.clearInput();
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not switch session: {s}", .{@errorName(err)}) catch "Could not switch session.";
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", message);
     }
 
     fn reportConnectionError(self: *App, err: anyerror) !void {
@@ -2623,76 +2440,36 @@ pub const App = struct {
         self.clearInput();
         var buffer: [128]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, "Could not connect to provider: {s}", .{@errorName(err)}) catch "Could not connect to provider.";
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", message);
     }
 
+    /// Open a fresh session on the active lane and reset the visible history.
     fn switchToNewSession(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, null);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-        try self.installRuntime(runtime);
+        try self.ws.switchToSession(self.cached_config, null);
+        self.afterRuntimeInstalled();
         try self.clearConversation();
     }
 
+    /// Resume `session_id` on the active lane and re-render its conversation.
     fn switchToSession(self: *App, session_id: []const u8) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const runtime = try self.createRuntime(self.liveRuntime().?.cwd, self.repoRoot() orelse self.liveRuntime().?.cwd, session_id);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-        try self.installRuntime(runtime);
+        try self.ws.switchToSession(self.cached_config, session_id);
+        self.afterRuntimeInstalled();
         try self.rebuildTranscriptFromAgent();
     }
 
-    fn createRuntime(self: *App, cwd: []const u8, session_dir: []const u8, session_id: ?[]const u8) !*runtime_mod.AgentRuntime {
-        const current = self.templateRuntime() orelse return error.NoActiveRuntime;
-        const runtime = try self.gpa.create(runtime_mod.AgentRuntime);
-        errdefer self.gpa.destroy(runtime);
-        const diagnostics = try current.gpa.alloc(config_mod.Diagnostic, 0);
-        errdefer current.gpa.free(diagnostics);
-        if (session_id) |id| {
-            try runtime.initResume(
-                current.gpa,
-                self.io,
-                cwd,
-                session_dir,
-                current.home_dir,
-                current.base_system_prompt,
-                self.cached_config,
-                diagnostics,
-                id,
-                current, // template: reuse the live lane's project prompt + skills
-            );
-        } else {
-            try runtime.initNew(
-                current.gpa,
-                self.io,
-                cwd,
-                session_dir,
-                current.home_dir,
-                current.base_system_prompt,
-                self.cached_config,
-                diagnostics,
-                current, // template: reuse the live lane's project prompt + skills
-            );
-        }
-        // Every lane shares the one background manager so jobs survive lane
-        // switches and are all torn down together at exit.
-        runtime.agent.background_manager = self.background;
-        return runtime;
+    /// View-side follow-up to a runtime swap: drop back to normal mode with an
+    /// empty composer and a reset turn view. The workspace has already replaced
+    /// the lane's engine, agent, and session id.
+    fn afterRuntimeInstalled(self: *App) void {
+        self.mode = .normal;
+        self.clearInput();
+        self.resetTurnState();
     }
 
     /// Repo root = the primary lane's working directory (it was launched there).
     /// Null only if the primary somehow has no runtime (headless/test).
     fn repoRoot(self: *const App) ?[]const u8 {
-        return switch (self.threads.items[0].engine) {
-            .live => |live| live.runtime.cwd,
-            .idle => null,
-        };
+        return self.ws.repoRoot();
     }
 
     /// Spawn a parallel lane: a fresh `git worktree` on its own `nova/<id>`
@@ -2701,62 +2478,18 @@ pub const App = struct {
     /// snapshot index — but can later be folded into another lane via `/merge`
     /// (or `/lanes` once parked). The hex branch is renamed to a descriptive
     /// `nova/<name>` once the model names it on the lane's first submit (see
-    /// `scheduleLaneNaming` / `drainLaneNaming`). Refused mid-turn.
+    /// `Workspace.scheduleNaming` / `drainNaming`). Refused mid-turn.
     fn createParallelLane(self: *App) !void {
-        if (self.threads.items.len >= 4) return error.TooManyLanes; // the split grid is 2×2
-        const repo = self.repoRoot() orelse return error.NoActiveRuntime;
-        const home = (self.liveRuntime() orelse return error.NoActiveRuntime).home_dir;
-        if (!vcs.isRepo(self.gpa, self.io, repo)) return error.NotAGitRepo;
-
-        // Recent parent-lane messages give the branch-naming request context
-        // for vague first prompts ("try the other approach").
+        // Recent parent-lane messages give the branch-naming request context for
+        // vague first prompts ("try the other approach"). Read off the visible
+        // transcript, so it stays here rather than in the workspace.
         const context = try self.captureLaneContext(lane_naming_context_max);
         errdefer {
             for (context) |message| self.gpa.free(message);
             if (context.len > 0) self.gpa.free(context);
         }
+        _ = try self.ws.createLane(self.cached_config, context);
 
-        var raw: [6]u8 = undefined;
-        self.io.random(&raw);
-        const id = std.fmt.bytesToHex(raw, .lower);
-
-        const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
-        errdefer self.gpa.free(branch);
-
-        // Worktrees live under the global `<home>/.nova/worktrees`, OUTSIDE the
-        // repo, so `git add -A`/snapshots/`/save` never see them.
-        const parent = try std.fs.path.join(self.gpa, &.{ home, ".nova", "worktrees" });
-        defer self.gpa.free(parent);
-        std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
-        const dest = try std.fs.path.join(self.gpa, &.{ parent, id[0..] });
-        errdefer self.gpa.free(dest);
-
-        try vcs.worktreeAdd(self.gpa, self.io, repo, dest, branch);
-        errdefer vcs.worktreeRemove(self.gpa, self.io, repo, dest) catch {};
-
-        const runtime = try self.createRuntime(dest, repo, null);
-        errdefer {
-            runtime.deinit();
-            self.gpa.destroy(runtime);
-        }
-
-        const lane = try self.gpa.create(Thread);
-        errdefer self.gpa.destroy(lane);
-        lane.* = .{
-            .id = runtime.session_writer.session.id,
-            .agent = &runtime.agent,
-            .worker_context = .{ .io = self.io, .gpa = runtime.gpa },
-            .parent_context = context,
-            .engine = .{ .live = .{
-                .lane = .{ .working = .{ .branch = branch, .path = dest } },
-                .runtime = runtime,
-                .owns = true,
-            } },
-        };
-        try self.threads.append(self.gpa, lane);
-
-        // Committed: `threads` owns `lane`, which owns `runtime`/`branch`/`dest`.
-        self.thread = lane;
         self.split = true; // a new lane implies tiling so both are visible
         self.mode = .normal;
         self.clearInput();
@@ -2771,7 +2504,7 @@ pub const App = struct {
             for (out.items) |message| self.gpa.free(message);
             out.deinit(self.gpa);
         }
-        const messages = self.thread.transcript.messages.items;
+        const messages = self.ws.active.transcript.messages.items;
         var index = messages.len;
         while (index > 0 and out.items.len < max) {
             index -= 1;
@@ -2784,132 +2517,24 @@ pub const App = struct {
         return out.toOwnedSlice(self.gpa);
     }
 
-    /// Ask the session's model (via the lane runtime's dedicated naming
-    /// client) to name the lane's branch from its first prompt + the captured
-    /// parent context. Fire-and-forget: the turn runs regardless, and
-    /// `drainLaneNaming` renames the hex branch when the result lands.
-    fn scheduleLaneNaming(self: *App, lane: *Thread, first_message: []const u8) !void {
-        if (lane.naming_future != null) return;
-        const runtime = switch (lane.engine) {
-            .live => |live| live.runtime,
-            .idle => return,
-        };
-        if (runtime.naming_client == .none) return;
-
-        const first = try self.gpa.dupe(u8, first_message);
-        errdefer self.gpa.free(first);
-        const job = try self.gpa.create(naming_mod.BranchJob);
-        job.* = .{
-            .gpa = self.gpa,
-            .client = runtime.naming_client,
-            .context = lane.parent_context,
-            .first_message = first,
-            .done = &lane.naming_done,
-        };
-        // The job owns the captured context now.
-        lane.parent_context = &.{};
-        lane.naming_done.store(false, .release);
-        lane.naming_future = self.io.concurrent(naming_mod.runBranchJob, .{job}) catch |err| {
-            job.deinit();
-            self.gpa.destroy(job);
-            return err;
-        };
-    }
-
-    /// Called from the tick handler: rename any lane whose branch name landed —
-    /// `nova/<hex>` becomes `nova/<slug>` in place (worktree HEADs follow), and
-    /// the branch becomes the lane's label. A rejected or colliding name simply
-    /// leaves the hex branch.
-    fn drainLaneNaming(self: *App) !bool {
-        var changed = false;
-        for (self.threads.items) |lane| {
-            if (lane.naming_future == null) continue;
-            if (!lane.naming_done.load(.acquire)) continue;
-            var outcome = lane.naming_future.?.await(self.io);
-            lane.naming_future = null;
-            lane.naming_done.store(false, .release);
-            defer outcome.deinit(self.gpa);
-            const slug = outcome.slug orelse continue;
-            if (self.renameLaneBranch(lane, slug) catch false) changed = true;
-        }
-        return changed;
-    }
-
-    /// Point `lane`'s working branch at `nova/<slug>` — the git rename plus the
-    /// lane's own records (branch string, label). False when the lane has no
-    /// working branch or the new name is taken.
-    fn renameLaneBranch(self: *App, lane: *Thread, slug: []const u8) !bool {
-        const live = switch (lane.engine) {
-            .live => |*live| live,
-            .idle => return false,
-        };
-        const working = switch (live.lane) {
-            .working => |*w| w,
-            .primary => return false,
-        };
-
-        const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{slug});
-        errdefer self.gpa.free(branch);
-        const title = try self.gpa.dupe(u8, branch);
-        errdefer self.gpa.free(title);
-
-        vcs.renameBranch(self.gpa, self.io, live.runtime.cwd, working.branch, branch) catch {
-            // Taken (or git refused) — the hex branch stays; not an error.
-            self.gpa.free(branch);
-            self.gpa.free(title);
-            return false;
-        };
-
-        self.gpa.free(working.branch);
-        working.branch = branch;
-        // The lane's label is its branch from here on.
-        if (lane.title) |old| self.gpa.free(old);
-        lane.title = title;
-        return true;
-    }
-
-    fn cancelLaneNaming(self: *App, lane: *Thread) void {
-        if (lane.naming_future) |*future| {
-            var outcome = future.cancel(self.io);
-            outcome.deinit(self.gpa);
-            lane.naming_future = null;
-        }
-        lane.naming_done.store(false, .release);
-    }
-
-    /// Whether any lane has an async branch-naming job in flight — the tick
-    /// must stay alive for the result to be drained.
-    fn namingActive(self: *const App) bool {
-        for (self.threads.items) |lane| {
-            if (lane.naming_future != null) return true;
-        }
-        return false;
-    }
-
     fn reportLaneError(self: *App, err: anyerror) !void {
         self.mode = .normal;
         self.clearInput();
         self.clearLanesState();
         const message = try std.fmt.allocPrint(self.gpa, "Lane operation failed: {s}", .{laneErrorText(err)});
         defer self.gpa.free(message);
-        _ = try self.thread.transcript.append(self.gpa, .agent, "agent", message);
+        _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", message);
     }
 
     fn activeIndex(self: *const App) usize {
-        for (self.threads.items, 0..) |lane, index| {
-            if (lane == self.thread) return index;
-        }
-        return 0;
+        return self.ws.activeIndex();
     }
 
     /// True while any lane has a turn in flight — keeps the drain/animation tick
     /// alive so background lanes' events (and their terminal `turn_finished`)
     /// keep draining even when the visible lane is idle.
     fn anyTurnActive(self: *const App) bool {
-        for (self.threads.items) |lane| {
-            if (lane.turn.state != .idle) return true;
-        }
-        return false;
+        return self.ws.anyTurnActive();
     }
 
     /// Cycle the active lane by `delta` (+1 next, -1 previous), wrapping at both
@@ -2917,11 +2542,11 @@ pub const App = struct {
     /// layouts: it moves the ● marker in split view and swaps the visible column
     /// when fullscreened.
     fn cycleLane(self: *App, delta: i32) void {
-        const n = self.threads.items.len;
+        const n = self.ws.lanes.items.len;
         if (n < 2) return;
         const cur: i32 = @intCast(self.activeIndex());
         const next: usize = @intCast(@mod(cur + delta, @as(i32, @intCast(n))));
-        self.thread = self.threads.items[next];
+        self.ws.active = self.ws.lanes.items[next];
         self.block_nav = false;
         self.clearInput();
     }
@@ -2936,7 +2561,7 @@ pub const App = struct {
     /// invisible. When fullscreened while other lanes remain, the pink "N Lanes"
     /// chip surfaces the hidden lanes and offers a click-back to split.
     fn toggleLaneFullscreen(self: *App) void {
-        if (self.threads.items.len < 2) return;
+        if (self.ws.lanes.items.len < 2) return;
         self.split = !self.split;
     }
 
@@ -2946,96 +2571,16 @@ pub const App = struct {
     /// resumable via `/resume`. The primary lane (index 0) can't be closed.
     /// Refused mid-turn.
     fn closeActiveLane(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        const index = self.activeIndex();
-        if (index == 0) return error.CannotClosePrimaryLane;
-
-        const lane = self.threads.items[index];
-        // Switch away and drop the lane before teardown so nothing dereferences
-        // it afterward. Unlike `abandonLane`, the worktree + branch are left on
-        // disk — a parked lane, surfaced by `/lanes`.
-        self.cancelLaneNaming(lane);
-        self.thread = self.threads.items[index - 1];
-        _ = self.threads.orderedRemove(index);
-        lane.deinit(self.gpa);
-        self.gpa.destroy(lane);
-
+        try self.ws.closeActiveLane();
         self.block_nav = false;
         self.clearInput();
     }
 
-    /// Tear down the working lane at `index` and DELETE its git worktree +
-    /// branch. Used for a merged source (its work now lives in the destination) —
-    /// unlike `/close`, which parks. Caller must ensure `index != 0` (never the
-    /// primary) and, if `index` is the active lane, point `self.thread` at a
-    /// survivor first.
-    fn abandonLane(self: *App, index: usize) !void {
-        const lane = self.threads.items[index];
-        var branch: ?[]u8 = null;
-        var dir: ?[]u8 = null;
-        if (workingLaneOf(lane)) |w| {
-            branch = try self.gpa.dupe(u8, w.branch);
-            dir = try self.gpa.dupe(u8, w.path);
-        }
-        defer if (branch) |b| self.gpa.free(b);
-        defer if (dir) |d| self.gpa.free(d);
-
-        // `lane.deinit` closes its (shared-repo) session connection; the worktree
-        // dir holds no DB, so it's safe to remove after.
-        self.cancelLaneNaming(lane);
-        _ = self.threads.orderedRemove(index);
-        lane.deinit(self.gpa);
-        self.gpa.destroy(lane);
-
-        if (self.repoRoot()) |repo| {
-            // Remove the worktree before deleting the branch — git won't delete a
-            // branch that's still checked out in a linked worktree.
-            if (dir) |d| vcs.worktreeRemove(self.gpa, self.io, repo, d) catch {};
-            if (branch) |b| vcs.deleteBranch(self.gpa, self.io, repo, b) catch {};
-        }
-    }
-
-    /// The directory to run a merge in for `lane` as the destination: its
-    /// worktree path, or the repo root for the primary lane.
-    fn laneMergeDir(self: *App, lane: *Thread) ?[]const u8 {
-        if (workingLaneOf(lane)) |w| return w.path;
-        return self.repoRoot();
-    }
-
-    /// Merge `source` into `dest`, then remove the source lane (its work now
-    /// lives in the destination). Refused if either lane has a turn in flight, or
-    /// if the merge conflicts (rolled back — the destination is untouched). On
-    /// success `dest` becomes the active lane. Leaves `mode`/picker state to the
-    /// caller so `/lanes` can stay open while `/merge` closes.
+    /// Merge `source` into `dest` and drop the source lane. Leaves `mode`/picker
+    /// state to the caller so `/lanes` can stay open while `/merge` closes.
     fn mergeLane(self: *App, source: MergeSource, dest: *Thread) !void {
-        if (dest.turn.isActive()) return error.InFlightTurn;
-        if (source.active_index) |si| {
-            if (self.threads.items[si].turn.isActive()) return error.InFlightTurn;
-        }
-        const dest_dir = self.laneMergeDir(dest) orelse return error.NoActiveRuntime;
-
-        // Seal the source so uncommitted lane work is included. The source is
-        // always a `nova/<id>` working lane (never the user's primary branch), so
-        // auto-committing here is safe and expected.
-        if (try vcs.workingTreeDirty(self.gpa, self.io, source.path)) {
-            try vcs.commitAll(self.gpa, self.io, source.path, "nova: merge lane");
-        }
-
-        switch (try vcs.merge(self.gpa, self.io, dest_dir, source.branch)) {
-            .conflict => return error.MergeConflict,
-            .ok => {},
-        }
-
-        // Fold complete: land on the surviving destination, then remove the source.
-        self.thread = dest;
-        if (source.active_index) |si| {
-            try self.abandonLane(si);
-        } else if (self.repoRoot()) |repo| {
-            vcs.worktreeRemove(self.gpa, self.io, repo, source.path) catch {};
-            vcs.deleteBranch(self.gpa, self.io, repo, source.branch) catch {};
-        }
-
-        if (self.threads.items.len < 2) self.split = false;
+        try self.ws.mergeLane(source, dest);
+        if (self.ws.lanes.items.len < 2) self.split = false;
         self.block_nav = false;
     }
 
@@ -3043,16 +2588,16 @@ pub const App = struct {
     /// from the primary lane. With exactly one other lane, merge immediately;
     /// otherwise open the destination picker (`Mode.lanes`, `.merge_dest`).
     fn createMergePicker(self: *App) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
+        if (self.ws.active.turn.isActive()) return error.InFlightTurn;
         const src_index = self.activeIndex();
         if (src_index == 0) return error.CannotMergePrimaryLane;
-        const src = workingLaneOf(self.thread) orelse return error.CannotMergePrimaryLane;
-        if (self.threads.items.len < 2) return error.NoMergeDestination;
+        const src = workingLaneOf(self.ws.active) orelse return error.CannotMergePrimaryLane;
+        if (self.ws.lanes.items.len < 2) return error.NoMergeDestination;
 
         const source: MergeSource = .{ .branch = src.branch, .path = src.path, .active_index = src_index };
 
-        if (self.threads.items.len == 2) {
-            const dest = self.threads.items[if (src_index == 0) 1 else 0];
+        if (self.ws.lanes.items.len == 2) {
+            const dest = self.ws.lanes.items[if (src_index == 0) 1 else 0];
             defer {
                 self.clearPaletteInput();
                 self.clearLanesState();
@@ -3065,7 +2610,7 @@ pub const App = struct {
 
         var dests: std.ArrayList(usize) = .empty;
         errdefer dests.deinit(self.gpa);
-        for (self.threads.items, 0..) |_, i| {
+        for (self.ws.lanes.items, 0..) |_, i| {
             if (i != src_index) try dests.append(self.gpa, i);
         }
         self.clearLanesState();
@@ -3090,8 +2635,8 @@ pub const App = struct {
             self.clearInput();
             return;
         }
-        const dest = self.threads.items[self.merge_dest_indices[self.lanes_selection]];
-        const src = workingLaneOf(self.threads.items[self.merge_source_index]) orelse {
+        const dest = self.ws.lanes.items[self.merge_dest_indices[self.lanes_selection]];
+        const src = workingLaneOf(self.ws.lanes.items[self.merge_source_index]) orelse {
             self.mode = .normal;
             self.clearInput();
             return;
@@ -3111,47 +2656,12 @@ pub const App = struct {
     fn openLanesPicker(self: *App) !void {
         const repo = self.repoRoot() orelse return error.NoActiveRuntime;
         self.clearLanesState();
-        self.parked_lanes = try self.collectParkedLanes(repo);
+        self.parked_lanes = try self.ws.collectParkedLanes(repo);
         self.lanes_purpose = .manage;
         self.lanes_selection = 0;
         self.mode = .lanes;
         self.clearInput();
         self.clearPaletteInput();
-    }
-
-    /// On-disk `nova/*` worktrees that are NOT currently open as lanes — the
-    /// parked lanes. Caller owns the result (free via `vcs.freeWorktreeList`).
-    fn collectParkedLanes(self: *App, repo: []const u8) ![]vcs.WorktreeEntry {
-        const all = try vcs.worktreeList(self.gpa, self.io, repo);
-        defer vcs.freeWorktreeList(self.gpa, all);
-
-        var out: std.ArrayList(vcs.WorktreeEntry) = .empty;
-        errdefer {
-            for (out.items) |*entry| entry.deinit(self.gpa);
-            out.deinit(self.gpa);
-        }
-        for (all) |entry| {
-            if (!std.mem.startsWith(u8, entry.branch, "nova/")) continue;
-            if (self.laneOpenAtPath(entry.path)) continue;
-            const path_dup = try self.gpa.dupe(u8, entry.path);
-            errdefer self.gpa.free(path_dup);
-            const branch_dup = try self.gpa.dupe(u8, entry.branch);
-            errdefer self.gpa.free(branch_dup);
-            try out.append(self.gpa, .{ .path = path_dup, .branch = branch_dup });
-        }
-        return out.toOwnedSlice(self.gpa);
-    }
-
-    /// Whether an open lane's worktree lives at `path`. Compares the final path
-    /// segment (the unique lane id) so it survives git reporting forward slashes
-    /// where the stored path uses the platform separator.
-    fn laneOpenAtPath(self: *App, path: []const u8) bool {
-        for (self.threads.items) |lane| {
-            if (workingLaneOf(lane)) |w| {
-                if (std.mem.eql(u8, lastPathSegment(w.path), lastPathSegment(path))) return true;
-            }
-        }
-        return false;
     }
 
     /// Reload the parked-lane list in place (after a merge/delete) and clamp the
@@ -3162,7 +2672,7 @@ pub const App = struct {
             vcs.freeWorktreeList(self.gpa, self.parked_lanes);
             self.parked_lanes = &.{};
         }
-        self.parked_lanes = try self.collectParkedLanes(repo);
+        self.parked_lanes = try self.ws.collectParkedLanes(repo);
         if (self.lanes_selection >= self.parked_lanes.len) {
             self.lanes_selection = if (self.parked_lanes.len == 0) 0 else @intCast(self.parked_lanes.len - 1);
         }
@@ -3174,18 +2684,14 @@ pub const App = struct {
         if (self.lanes_selection >= self.parked_lanes.len) return;
         const entry = self.parked_lanes[self.lanes_selection];
         const source: MergeSource = .{ .branch = entry.branch, .path = entry.path, .active_index = null };
-        try self.mergeLane(source, self.thread);
+        try self.mergeLane(source, self.ws.active);
         try self.reloadParkedLanes();
     }
 
     /// `/lanes` → X: delete the selected parked worktree and its branch.
     fn deleteSelectedParked(self: *App) !void {
         if (self.lanes_selection >= self.parked_lanes.len) return;
-        const entry = self.parked_lanes[self.lanes_selection];
-        if (self.repoRoot()) |repo| {
-            vcs.worktreeRemove(self.gpa, self.io, repo, entry.path) catch {};
-            vcs.deleteBranch(self.gpa, self.io, repo, entry.branch) catch {};
-        }
+        self.ws.deleteParkedLane(self.parked_lanes[self.lanes_selection]);
         try self.reloadParkedLanes();
     }
 
@@ -3224,7 +2730,7 @@ pub const App = struct {
             .merge_dest => {
                 const out = try arena.alloc(lanes_picker.Entry, self.merge_dest_indices.len);
                 for (self.merge_dest_indices, 0..) |ti, i| {
-                    const lane = self.threads.items[ti];
+                    const lane = self.ws.lanes.items[ti];
                     out[i] = .{
                         .title = lane.title orelse (if (ti == 0) "primary" else "lane"),
                         .subtitle = if (workingLaneOf(lane)) |w| w.branch else "(primary working copy)",
@@ -3258,54 +2764,35 @@ pub const App = struct {
         return false;
     }
 
-    fn installRuntime(self: *App, runtime: *runtime_mod.AgentRuntime) !void {
-        if (self.thread.turn.isActive()) return error.InFlightTurn;
-        self.cancelLaneNaming(self.thread);
-        if (self.liveRuntime()) |old| {
-            old.deinit();
-            self.gpa.destroy(old);
-        }
-        self.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
-        self.thread.agent = &runtime.agent;
-        self.thread.id = runtime.session_writer.session.id;
-        // The label belongs to the departed session; the next first prompt
-        // re-derives it.
-        if (self.thread.title) |title| self.gpa.free(title);
-        self.thread.title = null;
-        self.mode = .normal;
-        self.clearInput();
-        self.resetTurnState();
-    }
-
     fn clearConversation(self: *App) !void {
-        if (self.thread.transcript.messages.items.len > 0) {
-            try self.retired_transcripts.append(self.gpa, self.thread.transcript);
+        if (self.ws.active.transcript.messages.items.len > 0) {
+            try self.retired_transcripts.append(self.gpa, self.ws.active.transcript);
         }
-        self.thread.transcript = .{};
-        self.thread.transcript_list.scroll = .{};
+        self.ws.active.transcript = .{};
+        self.ws.active.transcript_list.scroll = .{};
     }
 
     fn rebuildTranscriptFromAgent(self: *App) !void {
         try self.clearConversation();
-        for (self.thread.agent.?.messages()) |message| {
+        for (self.ws.active.agent.?.messages()) |message| {
             if (message.role == .system) continue;
             const text = message.text();
             if (message.role == .user) {
-                _ = try self.thread.transcript.append(self.gpa, .user, "you", text);
+                _ = try self.ws.active.transcript.append(self.gpa, .user, "you", text);
             } else if (message.role == .assistant) {
-                if (text.len > 0) _ = try self.thread.transcript.append(self.gpa, .agent, "agent", text);
+                if (text.len > 0) _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", text);
             } else if (message.role == .tool) {
                 const title = try self.resumedToolTitle(message);
                 defer self.gpa.free(title);
-                const index = try self.thread.transcript.append(self.gpa, .tool, title, text);
-                self.thread.transcript.messages.items[index].failed = message.tool_failed;
+                const index = try self.ws.active.transcript.append(self.gpa, .tool, title, text);
+                self.ws.active.transcript.messages.items[index].failed = message.tool_failed;
             }
         }
-        if (self.thread.transcript.messages.items.len > 0) self.thread.transcript.selected = @intCast(self.thread.transcript.messages.items.len - 1);
+        if (self.ws.active.transcript.messages.items.len > 0) self.ws.active.transcript.selected = @intCast(self.ws.active.transcript.messages.items.len - 1);
         // A freshly installed (resumed) session left the label unset; re-derive
         // it from the conversation's first user message.
-        if (self.thread.title == null) {
-            for (self.thread.agent.?.messages()) |message| {
+        if (self.ws.active.title == null) {
+            for (self.ws.active.agent.?.messages()) |message| {
                 if (message.role != .user) continue;
                 try self.setLaneTitleIfUnset(message.text());
                 break;
@@ -3316,7 +2803,7 @@ pub const App = struct {
     fn resumedToolTitle(self: *App, message: ai.ChatMessage) ![]u8 {
         if (message.tool_display_label) |label| return transcript_mod.toolTitle(self.gpa, label);
         const id = message.call_id orelse return transcript_mod.toolTitle(self.gpa, "tool");
-        for (self.thread.agent.?.messages()) |candidate| {
+        for (self.ws.active.agent.?.messages()) |candidate| {
             for (candidate.content) |block| {
                 if (block != .tool_call) continue;
                 if (!std.mem.eql(u8, block.tool_call.call_id, id)) continue;
@@ -3387,9 +2874,9 @@ pub const App = struct {
     }
 
     fn selectionIsLastMessage(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (self.thread.transcript.messages.items.len == 0) return false;
-        return selected == self.thread.transcript.messages.items.len - 1;
+        const selected = self.ws.active.transcript.selected orelse return false;
+        if (self.ws.active.transcript.messages.items.len == 0) return false;
+        return selected == self.ws.active.transcript.messages.items.len - 1;
     }
 
     fn diffCountsVisible(self: *const App) bool {
@@ -3481,7 +2968,7 @@ pub const App = struct {
                 if (self.diff_loading) {
                     self.diff_loading = false;
                     self.mode = .normal;
-                    _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "Couldn't load diff.");
+                    _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", "Couldn't load diff.");
                     visible_change = true;
                 }
             },
@@ -3500,7 +2987,7 @@ pub const App = struct {
             state.deinit(self.gpa);
             self.mode = .normal;
             self.clearInput();
-            _ = try self.thread.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
+            _ = try self.ws.active.transcript.append(self.gpa, .agent, "agent", "No changes to review.");
             return;
         }
         self.diff.deinit(self.gpa);
@@ -3509,36 +2996,36 @@ pub const App = struct {
 
     fn jumpTranscriptToBottom(self: *App) void {
         self.block_nav = false;
-        self.thread.transcript.selectLast();
-        self.thread.auto_scroll = true;
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
+        self.ws.active.transcript.selectLast();
+        self.ws.active.auto_scroll = true;
+        self.ws.active.transcript_list.scroll.pending_lines = 0;
+        self.ws.active.transcript_list.scroll.wants_cursor = false;
     }
 
     fn updateMouseAutoScroll(self: *App) void {
-        self.thread.auto_scroll = !self.thread.transcript_list.scroll.has_more and
+        self.ws.active.auto_scroll = !self.ws.active.transcript_list.scroll.has_more and
             self.selectionIsLastMessage() and
             !self.selectedMessageIsLong();
     }
 
     fn navigateTranscript(self: *App, direction: TranscriptNavigation) bool {
-        self.thread.auto_scroll = false;
+        self.ws.active.auto_scroll = false;
         if (self.scrollSelectedLongMessage(direction)) return true;
 
-        const selected_before = self.thread.transcript.selected;
+        const selected_before = self.ws.active.transcript.selected;
         switch (direction) {
-            .previous => self.thread.transcript.moveSelection(.previous),
-            .next => self.thread.transcript.moveSelection(.next),
+            .previous => self.ws.active.transcript.moveSelection(.previous),
+            .next => self.ws.active.transcript.moveSelection(.next),
         }
-        if (self.thread.transcript.selected != selected_before) self.anchorSelectedLongMessage(direction);
+        if (self.ws.active.transcript.selected != selected_before) self.anchorSelectedLongMessage(direction);
         return false;
     }
 
     fn scrollSelectedLongMessage(self: *App, direction: TranscriptNavigation) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
+        const selected = self.ws.active.transcript.selected orelse return false;
+        if (selected >= self.ws.active.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.ws.active.transcript.messages.items[selected], ConversationLayout.contentWidth(self.ws.active.transcript_view_width));
+        const height = self.ws.active.transcript_view_height;
         if (rows <= height) return false;
         const rows_hidden = rows - height;
         const step = scrollStepRows(height);
@@ -3560,29 +3047,29 @@ pub const App = struct {
     }
 
     fn selectedMessageIsLong(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        return rows > self.thread.transcript_view_height;
+        const selected = self.ws.active.transcript.selected orelse return false;
+        if (selected >= self.ws.active.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.ws.active.transcript.messages.items[selected], ConversationLayout.contentWidth(self.ws.active.transcript_view_width));
+        return rows > self.ws.active.transcript_view_height;
     }
 
     /// True when the selected message is taller than the viewport and still has
     /// rows hidden below the current scroll offset (mirrors the `.next` branch of
     /// `scrollSelectedLongMessage`).
     fn selectedMessageCanScrollDown(self: *const App) bool {
-        const selected = self.thread.transcript.selected orelse return false;
-        if (selected >= self.thread.transcript.messages.items.len) return false;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
+        const selected = self.ws.active.transcript.selected orelse return false;
+        if (selected >= self.ws.active.transcript.messages.items.len) return false;
+        const rows = messageRowsCached(&self.ws.active.transcript.messages.items[selected], ConversationLayout.contentWidth(self.ws.active.transcript_view_width));
+        const height = self.ws.active.transcript_view_height;
         if (rows <= height) return false;
         return self.selectedMessageOffset(selected) < rows - height;
     }
 
     fn anchorSelectedLongMessage(self: *App, direction: TranscriptNavigation) void {
-        const selected = self.thread.transcript.selected orelse return;
-        if (selected >= self.thread.transcript.messages.items.len) return;
-        const rows = messageRowsCached(&self.thread.transcript.messages.items[selected], ConversationLayout.contentWidth(self.thread.transcript_view_width));
-        const height = self.thread.transcript_view_height;
+        const selected = self.ws.active.transcript.selected orelse return;
+        if (selected >= self.ws.active.transcript.messages.items.len) return;
+        const rows = messageRowsCached(&self.ws.active.transcript.messages.items[selected], ConversationLayout.contentWidth(self.ws.active.transcript_view_width));
+        const height = self.ws.active.transcript_view_height;
         if (rows <= height) return;
         const offset = switch (direction) {
             .next => 0,
@@ -3592,16 +3079,16 @@ pub const App = struct {
     }
 
     fn selectedMessageOffset(self: *const App, selected: u32) u16 {
-        if (self.thread.transcript_list.scroll.top == selected) return @intCast(@max(self.thread.transcript_list.scroll.offset, 0));
+        if (self.ws.active.transcript_list.scroll.top == selected) return @intCast(@max(self.ws.active.transcript_list.scroll.offset, 0));
         return 0;
     }
 
     fn setSelectedMessageOffset(self: *App, selected: u32, offset: u16) void {
-        self.thread.transcript_list.cursor = selected;
-        self.thread.transcript_list.scroll.top = selected;
-        self.thread.transcript_list.scroll.offset = @intCast(offset);
-        self.thread.transcript_list.scroll.pending_lines = 0;
-        self.thread.transcript_list.scroll.wants_cursor = false;
+        self.ws.active.transcript_list.cursor = selected;
+        self.ws.active.transcript_list.scroll.top = selected;
+        self.ws.active.transcript_list.scroll.offset = @intCast(offset);
+        self.ws.active.transcript_list.scroll.pending_lines = 0;
+        self.ws.active.transcript_list.scroll.wants_cursor = false;
     }
 };
 
@@ -3704,7 +3191,7 @@ pub fn run(
 
     // The logo message is a marker: the black-hole animation renders its frames
     // directly (see tui/blackhole.zig), so the body is intentionally empty.
-    _ = try app.thread.transcript.append(gpa, .logo, "logo", "");
+    _ = try app.ws.active.transcript.append(gpa, .logo, "logo", "");
 
     app.git_label = loadGitLabel(gpa, init.io, runtime.cwd) catch "";
     _ = app.refreshDiffCounts() catch false;
@@ -3837,7 +3324,7 @@ const RootWidget = struct {
                 // Scrolling may bring the logo back into view; the tick stops
                 // itself again on the next frame if it didn't.
                 try self.ensureTick(ctx);
-                if (mouse.button == .wheel_up) self.app.thread.auto_scroll = false;
+                if (mouse.button == .wheel_up) self.app.ws.active.auto_scroll = false;
                 if (mouse.button == .wheel_down) self.app.updateMouseAutoScroll();
                 if (mouse.type == .press and mouse.button == .left) {
                     if (self.app.lanes_chip_rect) |rect| {
@@ -3878,7 +3365,7 @@ const RootWidget = struct {
                         ctx.consumeAndRedraw();
                         return;
                     }
-                    if (self.app.thread.turn.state == .active) {
+                    if (self.app.ws.active.turn.state == .active) {
                         try self.app.handleInterrupt();
                         ctx.consumeAndRedraw();
                         return;
@@ -3968,7 +3455,7 @@ const RootWidget = struct {
                 // `handleTranscriptKey`, which walks blocks and re-enters the input
                 // when you press down past the last block. The @-mention popup
                 // keeps the arrows for itself.
-                if (self.app.mode == .normal and !self.app.at_active and self.app.thread.queued.items.len > 0) {
+                if (self.app.mode == .normal and !self.app.at_active and self.app.ws.active.queued.items.len > 0) {
                     // ALT+←/→ navigate queued messages; CTRL+→ steers the
                     // selected one. Gated on a non-empty queue so the keys fall
                     // through to normal cursor/word movement otherwise.
@@ -3998,7 +3485,7 @@ const RootWidget = struct {
                         }
                     } else if (key.matches(vaxis.Key.down, .{})) {
                         if (self.app.block_nav) {
-                            if (self.app.thread.transcript.selected == null) {
+                            if (self.app.ws.active.transcript.selected == null) {
                                 if (try self.app.moveInputCursorVertical(.down)) {
                                     self.app.block_nav = false;
                                     ctx.consumeAndRedraw();
@@ -4037,13 +3524,13 @@ const RootWidget = struct {
         if (try self.app.drainModelLoad()) visible_change = true;
         if (try self.app.drainDiffRefresh()) visible_change = true;
         // Lanes whose branch name landed get renamed in place.
-        if (try self.app.drainLaneNaming()) visible_change = true;
+        if (self.app.ws.drainNaming()) visible_change = true;
         // Collect any finished background jobs, then deliver buffered completions
         // to idle lanes (notice + a turn to answer them).
-        if (try self.app.pollBackgroundJobs()) visible_change = true;
+        if (self.app.ws.pollBackgroundJobs()) visible_change = true;
         if (try self.app.deliverPendingBackground()) visible_change = true;
 
-        if (self.app.thread.turn_view.awaitingOutput() or self.app.thread.transcript.hasRunningTool()) {
+        if (self.app.ws.active.turn_view.awaitingOutput() or self.app.ws.active.transcript.hasRunningTool()) {
             self.spinner_tick_accum += drain_tick_ms;
             if (self.spinner_tick_accum >= spinner_tick_threshold_ms) {
                 self.spinner_tick_accum = 0;
@@ -4087,8 +3574,8 @@ const RootWidget = struct {
             diff_loading or
             self.app.blackhole_visible or
             self.diff_refresh_pending or
-            self.app.backgroundActive() or
-            self.app.namingActive();
+            self.app.ws.backgroundActive() or
+            self.app.ws.namingActive();
         if (should_tick) {
             try ctx.tick(drain_tick_ms, self.widget());
         } else {
@@ -4118,7 +3605,7 @@ const RootWidget = struct {
             // (e.g. the cold-start "Loading diff…" the /diff command kicked off),
             // or a turn a command started directly (e.g. /sync conflict
             // resolution injects one).
-            if (self.app.thread.turn.isActive() or self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
+            if (self.app.ws.active.turn.isActive() or self.app.models.model_load_future != null or self.app.diff_refresh_future != null) try self.ensureTick(ctx);
             ctx.consumeAndRedraw();
             return;
         }
@@ -4158,20 +3645,20 @@ const RootWidget = struct {
     fn drainAgentEvents(self: *RootWidget, ctx: *vxfw.EventContext) !bool {
         var visible_change = false;
         var refresh_diff = false;
-        const active = self.app.thread;
+        const active = self.app.ws.active;
         // Each lane runs its own turn, so drain every lane's queue and apply its
-        // events to *that* lane. The Turn machine operates on `self.thread`, so
+        // events to *that* lane. The Turn machine operates on `self.ws.active`, so
         // scope-swap it to the lane being processed (UI-thread only) and restore
         // the visible lane afterward.
-        for (self.app.threads.items) |lane| {
+        for (self.app.ws.lanes.items) |lane| {
             const worker = if (lane.worker_context) |*wc| wc else continue;
             var batch: std.ArrayList(*agent_mod.Agent.Event) = .empty;
             defer batch.deinit(worker.gpa);
             try worker.queue.drainInto(worker.io, worker.gpa, &batch);
             if (batch.items.len == 0) continue;
 
-            self.app.thread = lane;
-            defer self.app.thread = active;
+            self.app.ws.active = lane;
+            defer self.app.ws.active = active;
             for (batch.items) |event_ptr| {
                 defer worker.gpa.destroy(event_ptr);
                 defer event_ptr.deinit(worker.gpa);
@@ -4203,15 +3690,15 @@ const RootWidget = struct {
         if (self.app.mode == .diff_viewer) return self.drawDiffViewer(ctx);
         const max_width = ctx.max.width orelse ctx.min.width;
         const max_height = ctx.max.height orelse ctx.min.height;
-        const loading_visible = self.app.thread.turn_view.awaitingOutput();
-        const split = self.app.split and self.app.threads.items.len > 1;
+        const loading_visible = self.app.ws.active.turn_view.awaitingOutput();
+        const split = self.app.split and self.app.ws.lanes.items.len > 1;
         // In split view always reserve the loading row so each column keeps a
         // fixed height across turns — the spinner appearing must not reflow.
-        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.thread.queued.items.len > 0);
+        const layout = rootLayout(max_height, false, try self.app.inputTextRows(ctx, max_width -| 4), loading_visible or split, self.app.ws.active.queued.items.len > 0);
         self.app.input_surface_row = layout.input_row;
         self.app.lanes_chip_rect = null;
 
-        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.thread };
+        var transcript_view: TranscriptWidget = .{ .app = self.app, .thread = self.app.ws.active };
         var loading_view: LoadingWidget = .{ .app = self.app };
         var input_view: InputWidget = .{ .app = self.app };
         var overlay_view: OverlayWidget = .{ .app = self.app };
@@ -4230,7 +3717,7 @@ const RootWidget = struct {
         const background_visible = self.app.background_modal and !overlay_visible and !permission_visible;
         const at_visible = self.app.at_active and !overlay_visible and !permission_visible and !background_visible;
 
-        var child_count: usize = (if (split) self.app.threads.items.len else 1) + 1;
+        var child_count: usize = (if (split) self.app.ws.lanes.items.len else 1) + 1;
         if (loading_visible) child_count += 1;
         if (overlay_visible) child_count += 1;
         if (permission_visible) child_count += 1;
@@ -4242,10 +3729,10 @@ const RootWidget = struct {
             // Tile the transcript area as a 2-wide grid: rows of two lanes, a
             // trailing odd lane spanning its row. The active lane is marked in
             // its border label; input + spinner stay shared below, routing to it.
-            const n = self.app.threads.items.len;
+            const n = self.app.ws.lanes.items.len;
             const rows: u16 = @intCast((n + 1) / 2);
             const cell_h: u16 = layout.transcript_height / rows;
-            for (self.app.threads.items, 0..) |lane, i| {
+            for (self.app.ws.lanes.items, 0..) |lane, i| {
                 const row: u16 = @intCast(i / 2);
                 const col: u16 = @intCast(i % 2);
                 const last_row = row == rows - 1;
@@ -4255,7 +3742,7 @@ const RootWidget = struct {
                 const h: u16 = if (last_row) layout.transcript_height - cell_h * (rows - 1) else cell_h;
                 children[idx] = .{
                     .origin = .{ .row = row * cell_h, .col = col * cell_w },
-                    .surface = try self.drawLaneColumn(ctx, lane, w, h, lane == self.app.thread),
+                    .surface = try self.drawLaneColumn(ctx, lane, w, h, lane == self.app.ws.active),
                     .z_index = 0,
                 };
                 idx += 1;
@@ -4622,7 +4109,7 @@ const BackgroundJobsWidget = struct {
             .width = ctx.max.width orelse 0,
             .height = ctx.max.height orelse 0,
         });
-        const manager = app.background orelse return empty;
+        const manager = app.ws.background orelse return empty;
         const views = manager.snapshot(ctx.arena) catch return empty;
         const inner = try ctx.arena.create(BackgroundJobsInner);
         inner.* = .{
@@ -4702,13 +4189,13 @@ const PermissionWidget = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *PermissionWidget = @ptrCast(@alignCast(ptr));
         const app = self.app;
-        const worker = if (app.thread.worker_context) |*context| context else {
+        const worker = if (app.ws.active.worker_context) |*context| context else {
             return vxfw.Surface.init(ctx.arena, self.widget(), .{
                 .width = ctx.max.width orelse 0,
                 .height = ctx.max.height orelse 0,
             });
         };
-        const snapshot = try worker.approval.snapshot(worker.io, ctx.arena, app.thread.permission_selection) orelse {
+        const snapshot = try worker.approval.snapshot(worker.io, ctx.arena, app.ws.active.permission_selection) orelse {
             return vxfw.Surface.init(ctx.arena, self.widget(), .{
                 .width = ctx.max.width orelse 0,
                 .height = ctx.max.height orelse 0,
@@ -4721,7 +4208,7 @@ const PermissionWidget = struct {
         if (width == 0 or height == 0) return surface;
 
         const inner = try ctx.arena.create(PermissionInner);
-        inner.* = .{ .snapshot = snapshot, .scroll = app.thread.permission_scroll };
+        inner.* = .{ .snapshot = snapshot, .scroll = app.ws.active.permission_scroll };
         var border: vxfw.Border = .{
             .child = inner.widget(),
             .labels = &.{.{ .text = "Unsafe bash command", .alignment = .top_left }},
@@ -5165,7 +4652,7 @@ const LoadingWidget = struct {
         });
         if (height > 0) {
             var row: u16 = if (height > 1) 1 else 0;
-            const word = loading_spinners[self.app.thread.turn_view.loading_word_index];
+            const word = loading_spinners[self.app.ws.active.turn_view.loading_word_index];
             tui_message.MessageWidget.drawLoading(&surface, word, self.app.loading_frame, &row, ctx);
         }
         return surface;
@@ -5288,35 +4775,8 @@ const TranscriptWidget = struct {
 /// `active_index` is its `threads` slot when it's an open lane (torn down via
 /// `abandonLane` after a successful merge), or null for a parked worktree
 /// (removed directly). Strings are borrowed for the duration of the merge.
-const MergeSource = struct {
-    branch: []const u8,
-    path: []const u8,
-    active_index: ?usize,
-};
-
-/// The `nova/<id>` worktree of `lane` if it's a working lane, else null (the
-/// primary lane carries no dedicated branch/worktree).
-fn workingLaneOf(lane: *Thread) ?vcs.Lane.Working {
-    const lane_ref: *const vcs.Lane = switch (lane.engine) {
-        .live => |*live| &live.lane,
-        .idle => |*l| l,
-    };
-    return switch (lane_ref.*) {
-        .working => |w| w,
-        .primary => null,
-    };
-}
-
-/// Final path segment, tolerant of both `/` and `\` separators and trailing
-/// slashes. Used to match worktree paths across git's forward-slash reporting
-/// and the platform-native paths Nova stores.
-fn lastPathSegment(path: []const u8) []const u8 {
-    var end = path.len;
-    while (end > 0 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
-    var start = end;
-    while (start > 0 and path[start - 1] != '/' and path[start - 1] != '\\') start -= 1;
-    return path[start..end];
-}
+const MergeSource = workspace_mod.MergeSource;
+const workingLaneOf = workspace_mod.Workspace.workingLaneOf;
 
 /// Friendly text for the lane-operation errors surfaced by `reportLaneError`.
 fn laneErrorText(err: anyerror) []const u8 {
@@ -5351,7 +4811,7 @@ const commands = [_]CommandEntry{
 
 /// Whether `entry` should appear in the palette given the current lane count.
 fn commandVisible(app: *const App, entry: CommandEntry) bool {
-    if (entry.multi_lane and app.threads.items.len < 2) return false;
+    if (entry.multi_lane and app.ws.lanes.items.len < 2) return false;
     return true;
 }
 
@@ -6176,7 +5636,7 @@ const InputWidget = struct {
         const max_width = ctx.max.width orelse 0;
         const height: u16 = ctx.max.height orelse 4;
 
-        const queued_visible = self.app.thread.queued.items.len > 0;
+        const queued_visible = self.app.ws.active.queued.items.len > 0;
         const input_row: u16 = if (queued_visible) 1 else 0;
         const avail: u16 = height -| input_row;
         const input_width = max_width -| 4;
@@ -6193,7 +5653,7 @@ const InputWidget = struct {
         const show_badge = show_hint and self.app.runningBackgroundCount() > 0;
         // The pink lanes chip only makes sense while fullscreened (not tiled)
         // with other lanes hidden behind the active one.
-        const show_lanes = show_hint and !self.app.split and self.app.threads.items.len > 1;
+        const show_lanes = show_hint and !self.app.split and self.app.ws.lanes.items.len > 1;
         const children_count: usize = 1 +
             @as(usize, if (show_hint) 1 else 0) +
             @as(usize, if (show_diff) 1 else 0) +
@@ -6294,7 +5754,7 @@ const InputWidget = struct {
     }
 
     fn drawQueuedMessage(self: *InputWidget, ctx: vxfw.DrawContext, width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const items = self.app.thread.queued.items;
+        const items = self.app.ws.active.queued.items;
         const sel = @min(self.app.queued_selection, items.len - 1);
         const message = items[sel];
         // Position suffix only when there's more than one to navigate.
@@ -6323,7 +5783,7 @@ const InputWidget = struct {
     /// lane is fullscreened. Black-on-pink so it reads as a control affordance;
     /// clicking it (mouse) or pressing Ctrl+L restores the split view.
     fn drawLanesBadge(self: *InputWidget, ctx: vxfw.DrawContext, max_width: u16) std.mem.Allocator.Error!vxfw.Surface {
-        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.threads.items.len});
+        const text = try std.fmt.allocPrint(ctx.arena, " {d} Lanes ", .{self.app.ws.lanes.items.len});
         const text_width: u16 = @intCast(@min(ctx.stringWidth(text), max_width));
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), .{ .width = text_width, .height = 1 });
         if (text_width == 0) return surface;
@@ -6620,7 +6080,7 @@ test "esc backs out of command panels before interrupting active turn" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    app.thread.turn.submit();
+    app.ws.active.turn.submit();
     app.mode = .provider_picker;
 
     var root: RootWidget = .{ .app = &app };
@@ -6631,7 +6091,7 @@ test "esc backs out of command panels before interrupting active turn" {
     try RootWidget.captureEvent(&root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
-    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    try std.testing.expectEqual(Turn.State.active, app.ws.active.turn.state);
 }
 
 test "ctrl-c clears a non-empty input instead of arming quit" {
@@ -6665,29 +6125,29 @@ test "down past the last block re-enters the input" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     // Tall viewport so the short messages never count as scrollable.
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 100;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 100;
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "three");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "two");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "three");
     // Following the tail, the last block is selected.
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(?u32, 2), app.ws.active.transcript.selected);
 
     // In block navigation, up walks to an earlier block.
     app.block_nav = true;
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.up });
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(?u32, 1), app.ws.active.transcript.selected);
 
     // Down walks back toward the last block, still navigating blocks.
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(?u32, 2), app.ws.active.transcript.selected);
     try std.testing.expect(app.block_nav);
 
     // Down again on the last block hands control back to the input.
     _ = try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down });
     try std.testing.expect(!app.block_nav);
-    try std.testing.expectEqual(@as(?u32, 2), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(?u32, 2), app.ws.active.transcript.selected);
 }
 
 test "down past the last block moves into multiline input" {
@@ -6696,10 +6156,10 @@ test "down past the last block moves into multiline input" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 100;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 100;
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one");
     try app.input.insertSliceAtCursor("top\nmiddle");
     // Put the cursor on the top line, just before the newline. Re-entering
     // from block navigation should step down into the input line below.
@@ -6799,15 +6259,15 @@ test "mouse bottom does not enable auto-scroll when older message is selected" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
-    app.thread.transcript.selected = 0;
-    app.thread.auto_scroll = false;
-    app.thread.transcript_list.scroll.has_more = false;
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "two");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.auto_scroll = false;
+    app.ws.active.transcript_list.scroll.has_more = false;
 
     app.updateMouseAutoScroll();
 
-    try std.testing.expect(!app.thread.auto_scroll);
+    try std.testing.expect(!app.ws.active.auto_scroll);
 }
 
 test "shift down jumps to conversation bottom" {
@@ -6817,16 +6277,16 @@ test "shift down jumps to conversation bottom" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "two");
-    _ = try app.thread.transcript.append(gpa, .status, "status", "loading");
-    app.thread.transcript.selected = 0;
-    app.thread.auto_scroll = false;
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "two");
+    _ = try app.ws.active.transcript.append(gpa, .status, "status", "loading");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.auto_scroll = false;
 
     try std.testing.expect(try app.handleTranscriptKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } }));
 
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
-    try std.testing.expect(app.thread.auto_scroll);
+    try std.testing.expectEqual(@as(?u32, 1), app.ws.active.transcript.selected);
+    try std.testing.expect(app.ws.active.auto_scroll);
 }
 
 test "down scrolls through selected long message before moving selection" {
@@ -6836,18 +6296,18 @@ test "down scrolls through selected long message before moving selection" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
-    app.thread.transcript.selected = 0;
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 4;
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "next");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 4;
 
     const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
-    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.scroll.top);
-    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
+    try std.testing.expectEqual(@as(?u32, 0), app.ws.active.transcript.selected);
+    try std.testing.expectEqual(@as(u32, 0), app.ws.active.transcript_list.scroll.top);
+    try std.testing.expect(app.ws.active.transcript_list.scroll.offset > 0);
 }
 
 test "long message scroll uses a small fixed step" {
@@ -6863,18 +6323,18 @@ test "down at latest long message bottom does not loop to top" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    app.thread.transcript.selected = 0;
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 4;
-    const offset = messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height;
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 4;
+    const offset = messageRowsCached(&app.ws.active.transcript.messages.items[0], ConversationLayout.contentWidth(app.ws.active.transcript_view_width)) - app.ws.active.transcript_view_height;
     app.setSelectedMessageOffset(0, offset);
 
     const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
-    try std.testing.expectEqual(@as(i17, @intCast(offset)), app.thread.transcript_list.scroll.offset);
+    try std.testing.expectEqual(@as(?u32, 0), app.ws.active.transcript.selected);
+    try std.testing.expectEqual(@as(i17, @intCast(offset)), app.ws.active.transcript_list.scroll.offset);
 }
 
 test "down moves after selected long message bottom is visible" {
@@ -6884,17 +6344,17 @@ test "down moves after selected long message bottom is visible" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
-    app.thread.transcript.selected = 0;
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 4;
-    app.setSelectedMessageOffset(0, messageRowsCached(&app.thread.transcript.messages.items[0], ConversationLayout.contentWidth(app.thread.transcript_view_width)) - app.thread.transcript_view_height);
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "next");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 4;
+    app.setSelectedMessageOffset(0, messageRowsCached(&app.ws.active.transcript.messages.items[0], ConversationLayout.contentWidth(app.ws.active.transcript_view_width)) - app.ws.active.transcript_view_height);
 
     const scrolled = app.navigateTranscript(.next);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript.selected);
+    try std.testing.expectEqual(@as(?u32, 1), app.ws.active.transcript.selected);
 }
 
 test "up enters selected long message at bottom" {
@@ -6904,21 +6364,21 @@ test "up enters selected long message at bottom" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "next");
-    app.thread.transcript.selected = 1;
-    app.thread.transcript_view_width = 80;
-    app.thread.transcript_view_height = 4;
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "next");
+    app.ws.active.transcript.selected = 1;
+    app.ws.active.transcript_view_width = 80;
+    app.ws.active.transcript_view_height = 4;
 
     const scrolled = app.navigateTranscript(.previous);
 
     try std.testing.expect(!scrolled);
-    try std.testing.expectEqual(@as(?u32, 0), app.thread.transcript.selected);
-    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
+    try std.testing.expectEqual(@as(?u32, 0), app.ws.active.transcript.selected);
+    try std.testing.expect(app.ws.active.transcript_list.scroll.offset > 0);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.ws.active };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -6927,7 +6387,7 @@ test "up enters selected long message at bottom" {
     };
     _ = try transcript_widget.widget().draw(ctx);
 
-    try std.testing.expect(app.thread.transcript_list.scroll.offset > 0);
+    try std.testing.expect(app.ws.active.transcript_list.scroll.offset > 0);
 }
 
 test "begin submit clears input and starts a turn awaiting output" {
@@ -6948,11 +6408,11 @@ test "begin submit clears input and starts a turn awaiting output" {
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.secondHalf().len);
     // The user message is the only transcript entry; the loading spinner is never
     // stored as a message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("hello", app.thread.transcript.messages.items[0].body);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
-    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
-    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("hello", app.ws.active.transcript.messages.items[0].body);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
+    try std.testing.expectEqual(Turn.State.active, app.ws.active.turn.state);
+    try std.testing.expectEqual(@as(u32, 0), app.ws.active.transcript.selected.?);
 }
 
 test "awaiting turn draws loading outside the transcript list" {
@@ -6962,8 +6422,8 @@ test "awaiting turn draws loading outside the transcript list" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .user, "you", "hello");
-    app.thread.turn_view.awaitModel();
+    _ = try app.ws.active.transcript.append(gpa, .user, "you", "hello");
+    app.ws.active.turn_view.awaitModel();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -6977,8 +6437,8 @@ test "awaiting turn draws loading outside the transcript list" {
     const surface = try root_widget.widget().draw(ctx);
 
     try std.testing.expectEqual(@as(usize, 3), surface.children.len);
-    try std.testing.expectEqual(@as(?u32, 1), app.thread.transcript_list.item_count);
-    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
+    try std.testing.expectEqual(@as(?u32, 1), app.ws.active.transcript_list.item_count);
+    try std.testing.expectEqual(@as(u32, 0), app.ws.active.transcript_list.cursor);
     try std.testing.expectEqual(rootLayout(10, false, 1, true, false).loading_row, surface.children[1].origin.row);
 }
 
@@ -6989,10 +6449,10 @@ test "awaiting turn preserves selected long message inner scroll" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    _ = try app.thread.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-    app.thread.transcript.selected = 0;
-    app.thread.auto_scroll = false;
-    app.thread.turn_view.awaitModel();
+    _ = try app.ws.active.transcript.append(gpa, .agent, "agent", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+    app.ws.active.transcript.selected = 0;
+    app.ws.active.auto_scroll = false;
+    app.ws.active.turn_view.awaitModel();
     app.setSelectedMessageOffset(0, 3);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -7006,9 +6466,9 @@ test "awaiting turn preserves selected long message inner scroll" {
     };
     _ = try root_widget.widget().draw(ctx);
 
-    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.cursor);
-    try std.testing.expectEqual(@as(u32, 0), app.thread.transcript_list.scroll.top);
-    try std.testing.expectEqual(@as(i17, 3), app.thread.transcript_list.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 0), app.ws.active.transcript_list.cursor);
+    try std.testing.expectEqual(@as(u32, 0), app.ws.active.transcript_list.scroll.top);
+    try std.testing.expectEqual(@as(i17, 3), app.ws.active.transcript_list.scroll.offset);
 }
 
 test "begin submit queues while turn is in flight" {
@@ -7019,23 +6479,23 @@ test "begin submit queues while turn is in flight" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
     // Simulate a turn already streaming and waiting on the next chunk.
-    app.thread.turn.submit();
-    app.thread.turn_view.awaitModel();
+    app.ws.active.turn.submit();
+    app.ws.active.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
-    try std.testing.expectEqual(@as(usize, 1), app.thread.queued.items.len);
-    try std.testing.expectEqualStrings("later", app.thread.queued.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.queued.items.len);
+    try std.testing.expectEqualStrings("later", app.ws.active.queued.items[0].text);
     try std.testing.expectEqual(@as(u32, 1), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.input.buf.firstHalf().len);
     try std.testing.expect(try app.applyAgentEvent(.{ .queued_messages_flushed = 1 }));
-    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.ws.active.queued.items.len);
     // Just the flushed user message; the spinner stays derived UI.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("later", app.thread.transcript.messages.items[0].body);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("later", app.ws.active.transcript.messages.items[0].body);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
 }
 
 test "queued prompt draws above input at minimum input height" {
@@ -7045,8 +6505,8 @@ test "queued prompt draws above input at minimum input height" {
 
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread.turn.submit();
-    app.thread.turn_view.awaitModel();
+    app.ws.active.turn.submit();
+    app.ws.active.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
@@ -7075,8 +6535,8 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread.turn.submit();
-    app.thread.turn_view.awaitModel();
+    app.ws.active.turn.submit();
+    app.ws.active.turn_view.awaitModel();
 
     try app.input.insertSliceAtCursor("first");
     try std.testing.expect(!try app.beginSubmit());
@@ -7094,7 +6554,7 @@ test "alt navigation and ctrl-steer drive the queued message line" {
 
     // CTRL+→ steers the selected message in both the mirror and agent queue.
     app.steerSelectedQueued();
-    try std.testing.expect(app.thread.queued.items[0].steer);
+    try std.testing.expect(app.ws.active.queued.items[0].steer);
     try std.testing.expect(agent.message_queue.at(&agent.message_queue_storage, 0).?.steer);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -7124,8 +6584,8 @@ test "begin submit shows notice when queued message queue is full" {
 
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread.turn.submit();
-    app.thread.turn_view.awaitModel();
+    app.ws.active.turn.submit();
+    app.ws.active.turn_view.awaitModel();
 
     var queued_count: usize = 0;
     while (queued_count < agent.message_queue_storage.len) : (queued_count += 1) {
@@ -7135,14 +6595,14 @@ test "begin submit shows notice when queued message queue is full" {
     try app.input.insertSliceAtCursor("later");
     try std.testing.expect(!try app.beginSubmit());
 
-    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.ws.active.queued.items.len);
     try std.testing.expectEqual(@as(u32, @intCast(agent.message_queue_storage.len)), agent.message_queue.len());
     try std.testing.expectEqualStrings("later", app.input.buf.firstHalf());
     // The notice is the only transcript row; the spinner is not a status message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.notice, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqualStrings("MessageQueueFull", app.thread.transcript.messages.items[0].body);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.notice, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqualStrings("MessageQueueFull", app.ws.active.transcript.messages.items[0].body);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
 }
 
 test "opening model picker starts at top" {
@@ -7269,7 +6729,7 @@ test "provider picker selects sign out horizontally" {
     var codex_client: ai.codex_responses.Client = undefined;
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.client = .{ .codex_responses = &codex_client };
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     app.codex_signed_in = true;
 
     app.mode = .provider_picker;
@@ -7316,7 +6776,7 @@ test "codex sign-in survives selecting local compatible provider" {
     runtime.owned_naming_client = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
     defer runtime.disconnectClient();
 
@@ -7355,7 +6815,7 @@ test "switching from codex to catalogue provider resets cached connection" {
     defer runtime.disconnectClient();
 
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
 
     app.models.model_scope = .session;
@@ -7474,7 +6934,7 @@ test "expired codex connection reports reconnect message" {
     runtime.diagnostics = &.{};
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     app.cached_config = .{ .provider = .openai };
 
     const message = try app.formatNoProviderMessage();
@@ -7504,8 +6964,8 @@ test "typing slash can open command menu after input changed before" {
 
     try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = 'x', .text = "x" } });
     app.input.clearRetainingCapacity();
-    app.thread.turn.submit();
-    defer app.thread.turn.reset();
+    app.ws.active.turn.submit();
+    defer app.ws.active.turn.reset();
     try app.input.widget().handleEvent(&ctx, .{ .key_press = .{ .codepoint = '/', .text = "/" } });
 
     try std.testing.expectEqual(App.Mode.command, app.mode);
@@ -7523,20 +6983,20 @@ test "reprompt after interrupt starts a fresh turn" {
 
     try app.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
+    if (app.ws.active.pending_prompt) |prompt| app.ws.active.worker_context.?.gpa.free(prompt);
+    app.ws.active.pending_prompt = null;
     try app.handleInterrupt();
 
     try app.input.insertSliceAtCursor("second");
     try std.testing.expect(try app.beginSubmit());
-    defer app.thread.turn.reset();
+    defer app.ws.active.turn.reset();
     defer {
-        if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-        app.thread.pending_prompt = null;
+        if (app.ws.active.pending_prompt) |prompt| app.ws.active.worker_context.?.gpa.free(prompt);
+        app.ws.active.pending_prompt = null;
     }
 
-    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
-    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(Turn.State.active, app.ws.active.turn.state);
+    try std.testing.expectEqual(@as(usize, 0), app.ws.active.queued.items.len);
 }
 
 test "interrupt drops the turn straight back to idle" {
@@ -7551,16 +7011,16 @@ test "interrupt drops the turn straight back to idle" {
 
     try app.input.insertSliceAtCursor("first");
     try std.testing.expect(try app.beginSubmit());
-    if (app.thread.pending_prompt) |prompt| app.thread.worker_context.?.gpa.free(prompt);
-    app.thread.pending_prompt = null;
-    try std.testing.expectEqual(Turn.State.active, app.thread.turn.state);
+    if (app.ws.active.pending_prompt) |prompt| app.ws.active.worker_context.?.gpa.free(prompt);
+    app.ws.active.pending_prompt = null;
+    try std.testing.expectEqual(Turn.State.active, app.ws.active.turn.state);
 
     // Interrupt must not leave the lane lingering in `interrupting` waiting for
     // a (possibly blocked) worker to reach its next cancellation point — the UI
     // would read as in-flight. The worker is torn down and the turn is idle.
     try app.handleInterrupt();
-    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
-    try std.testing.expect(!app.thread.turn.isActive());
+    try std.testing.expectEqual(Turn.State.idle, app.ws.active.turn.state);
+    try std.testing.expect(!app.ws.active.turn.isActive());
 }
 
 test "lane commands stay hidden until a second lane exists" {
@@ -7587,7 +7047,7 @@ test "lane commands stay hidden until a second lane exists" {
     // A second lane unhides the multi-lane commands.
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.ws.lanes.append(gpa, lane2);
     try std.testing.expect(resolveCommand(&app, "Merge") == .merge);
     try std.testing.expect(resolveCommand(&app, "Close") == .close);
 }
@@ -7608,10 +7068,10 @@ test "cycleLane wraps the active lane in both directions" {
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.ws.lanes.append(gpa, lane2);
     const lane3 = try gpa.create(Thread);
     lane3.* = .{};
-    try app.threads.append(gpa, lane3);
+    try app.ws.lanes.append(gpa, lane3);
 
     try std.testing.expectEqual(@as(usize, 0), app.activeIndex());
     app.cycleLane(1);
@@ -7643,7 +7103,7 @@ test "toggleLaneFullscreen flips split only when multiple lanes exist" {
 
     const lane2 = try gpa.create(Thread);
     lane2.* = .{};
-    try app.threads.append(gpa, lane2);
+    try app.ws.lanes.append(gpa, lane2);
     app.split = true; // parallel lanes open tiled
     app.toggleLaneFullscreen();
     try std.testing.expect(!app.split); // now fullscreened
@@ -7680,7 +7140,7 @@ test "model selection is allowed after interrupt" {
     runtime.owned_naming_client = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
     defer runtime.disconnectClient();
 
@@ -7689,12 +7149,12 @@ test "model selection is allowed after interrupt" {
     app.cached_config_owned = true;
     app.cached_config.base_url = try gpa.dupe(u8, "http://localhost:11434/v1");
     app.cached_config.api_key = try gpa.dupe(u8, "ollama");
-    app.thread.turn.submit();
-    app.thread.turn.interrupt();
+    app.ws.active.turn.submit();
+    app.ws.active.turn.interrupt();
 
     try app.applySelectedModel();
 
-    try std.testing.expectEqual(Turn.State.idle, app.thread.turn.state);
+    try std.testing.expectEqual(Turn.State.idle, app.ws.active.turn.state);
     try std.testing.expectEqual(config_mod.Provider.ollama, app.cached_config.provider.?);
 }
 
@@ -7717,26 +7177,26 @@ test "interrupt restart flushes queued messages to the transcript when no provid
     runtime.owned_naming_client = null;
     runtime.naming_client = .none;
     var app = try App.init(std.testing.io, gpa, &runtime.agent);
-    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+    app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
     defer app.deinit();
-    defer app.thread.turn.reset();
+    defer app.ws.active.turn.reset();
 
     // Queue two messages behind a running turn.
-    app.thread.turn.submit();
+    app.ws.active.turn.submit();
     try app.input.insertSliceAtCursor("one");
     try std.testing.expect(!try app.beginSubmit());
     try app.input.insertSliceAtCursor("two");
     try std.testing.expect(!try app.beginSubmit());
-    try std.testing.expectEqual(@as(usize, 2), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.queued.items.len);
 
     // With no provider, the restart surfaces the queued text and drops the queue
     // rather than spinning up a doomed worker.
     try std.testing.expect(try app.restartTurnForQueuedMessages());
-    try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.ws.active.queued.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("one", app.thread.transcript.messages.items[0].body);
-    try std.testing.expectEqualStrings("two", app.thread.transcript.messages.items[1].body);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("one", app.ws.active.transcript.messages.items[0].body);
+    try std.testing.expectEqualStrings("two", app.ws.active.transcript.messages.items[1].body);
 }
 
 test "canceling a picker returns to command menu" {
@@ -7819,12 +7279,12 @@ test "empty text deltas do not create selectable messages" {
     _ = try app.beginSubmit();
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .response_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "" }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
 }
 
 test "agent app events update transcript on the ui side" {
@@ -7856,13 +7316,13 @@ test "agent app events update transcript on the ui side" {
         .display_body = "$ ls\nexit 0\nstdout:\n\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
-    try std.testing.expectEqualStrings("checking files", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.thinking, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
+    try std.testing.expectEqualStrings("checking files", app.ws.active.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[2].title);
 }
 
 test "user can navigate away from a streaming thinking block" {
@@ -7880,13 +7340,13 @@ test "user can navigate away from a streaming thinking block" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "first chunk" });
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.thinking, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 
-    app.thread.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    app.ws.active.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 }
 
 test "user can navigate away from a streaming agent message" {
@@ -7904,13 +7364,13 @@ test "user can navigate away from a streaming agent message" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first chunk" });
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.agent, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 
-    app.thread.transcript.moveSelection(.previous);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    app.ws.active.transcript.moveSelection(.previous);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 
     _ = try app.applyAgentEvent(.{ .response_delta = " more" });
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[app.thread.transcript.selected.?].kind);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[app.ws.active.transcript.selected.?].kind);
 }
 
 test "empty content delta does not finalize thinking" {
@@ -7928,17 +7388,17 @@ test "empty content delta does not finalize thinking" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = "thinking" });
-    const thinking_index = app.thread.turn_view.thinking_index.?;
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    const thinking_index = app.ws.active.turn_view.thinking_index.?;
+    try std.testing.expectEqualStrings("Thinking...", app.ws.active.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.ws.active.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .thinking_delta = " more" });
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thinking...", app.ws.active.transcript.messages.items[thinking_index].title);
 
     _ = try app.applyAgentEvent(.{ .response_delta = "answer" });
-    try std.testing.expectEqualStrings("Thoughts", app.thread.transcript.messages.items[thinking_index].title);
+    try std.testing.expectEqualStrings("Thoughts", app.ws.active.transcript.messages.items[thinking_index].title);
 }
 
 test "content deltas do not override user scroll state" {
@@ -7956,11 +7416,11 @@ test "content deltas do not override user scroll state" {
     _ = try app.beginSubmit();
 
     _ = try app.applyAgentEvent(.{ .response_delta = "first" });
-    try std.testing.expect(app.thread.auto_scroll);
+    try std.testing.expect(app.ws.active.auto_scroll);
 
-    app.thread.auto_scroll = false;
+    app.ws.active.auto_scroll = false;
     _ = try app.applyAgentEvent(.{ .response_delta = " second" });
-    try std.testing.expect(!app.thread.auto_scroll);
+    try std.testing.expect(!app.ws.active.auto_scroll);
 }
 
 test "loading does not appear during final answer after tool batch" {
@@ -7992,13 +7452,13 @@ test "loading does not appear during final answer after tool batch" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     // No status message — the spinner is derived; the batch leaves us awaiting
     // the next response over the user + tool rows.
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Final answer" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.agent, app.ws.active.transcript.messages.items[2].kind);
 }
 
 test "loading does not reappear between content chunks" {
@@ -8020,9 +7480,9 @@ test "loading does not reappear between content chunks" {
     // its own progress indicator.
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "Here's the implementation plan:" }));
     _ = try app.applyAgentEvent(.delta_end);
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.ws.active.transcript.messages.items[1].kind);
 }
 
 test "bash tool waits for complete arguments while streaming" {
@@ -8044,8 +7504,8 @@ test "bash tool waits for complete arguments while streaming" {
         .name = "bash",
         .arguments = "{\"command\":\"printf hello",
     } }));
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -8054,9 +7514,9 @@ test "bash tool waits for complete arguments while streaming" {
         .display_expanded_label = "printf hello",
         .display_body = "hello",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
 }
 
 test "tool row persists through finish and turn completion" {
@@ -8078,17 +7538,17 @@ test "tool row persists through finish and turn completion" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  ls", app.thread.transcript.messages.items[1].tool_expanded_title.?);
-    try std.testing.expect(app.thread.transcript.messages.items[1].tool_running);
-    try std.testing.expect(app.thread.transcript.hasRunningTool());
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  ls", app.ws.active.transcript.messages.items[1].tool_expanded_title.?);
+    try std.testing.expect(app.ws.active.transcript.messages.items[1].tool_running);
+    try std.testing.expect(app.ws.active.transcript.hasRunningTool());
 
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -8097,16 +7557,16 @@ test "tool row persists through finish and turn completion" {
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expect(!app.thread.transcript.messages.items[1].tool_running);
-    try std.testing.expect(!app.thread.transcript.hasRunningTool());
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expect(!app.ws.active.transcript.messages.items[1].tool_running);
+    try std.testing.expect(!app.ws.active.transcript.hasRunningTool());
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
 
     try std.testing.expect(try app.applyAgentEvent(.turn_finished));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
 }
 
 test "partial tool arguments do not create visible tool rows" {
@@ -8130,18 +7590,18 @@ test "partial tool arguments do not create visible tool rows" {
     } }));
     // Partial arguments render nothing, so no tool row appears and the spinner
     // stays up (awaiting) over the lone user message.
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
 }
 
 test "tool finish creates row if no complete streamed arguments appeared" {
@@ -8171,9 +7631,9 @@ test "tool finish creates row if no complete streamed arguments appeared" {
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
 }
 
 test "new tool response index creates a new transcript row" {
@@ -8210,11 +7670,11 @@ test "new tool response index creates a new transcript row" {
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqualStrings("🛠  List files", app.thread.transcript.messages.items[1].title);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[2].kind);
+    try std.testing.expectEqualStrings("🛠  List files", app.ws.active.transcript.messages.items[1].title);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.ws.active.transcript.messages.items[2].title);
 }
 
 test "bash tool after batch creates a new tool row" {
@@ -8245,8 +7705,8 @@ test "bash tool after batch creates a new tool row" {
     } }));
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     // Awaiting the next segment over the user + tool rows; spinner is derived.
-    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
-    try std.testing.expect(app.thread.turn_view.awaitingOutput());
+    try std.testing.expectEqual(@as(usize, 2), app.ws.active.transcript.messages.items.len);
+    try std.testing.expect(app.ws.active.turn_view.awaitingOutput());
 
     _ = try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -8254,10 +7714,10 @@ test "bash tool after batch creates a new tool row" {
         .arguments = "{\"command\":\"printf done\",\"reason\":\"Print done\"}",
     } });
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[2].kind);
 }
 
 test "late tool finish does not move selection upward" {
@@ -8279,14 +7739,14 @@ test "late tool finish does not move selection upward" {
         .name = "bash",
         .arguments = "{\"command\":\"ls\",\"reason\":\"List files\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 1,
         .name = "bash",
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -8295,11 +7755,11 @@ test "late tool finish does not move selection upward" {
         .display_expanded_label = "ls",
         .display_body = "$ ls\nexit 0\nstdout:\nfile\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "done" }));
-    try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 3), app.ws.active.transcript.selected.?);
 }
 
 test "loading does not resume after post-tool thinking delta" {
@@ -8333,11 +7793,11 @@ test "loading does not resume after post-tool thinking delta" {
     try std.testing.expect(!try app.applyAgentEvent(.{ .thinking_delta = "checking output" }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
 
-    try std.testing.expectEqual(@as(usize, 3), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.thinking, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqualStrings("Thinking...", app.thread.transcript.messages.items[2].title);
+    try std.testing.expectEqual(@as(usize, 3), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.thinking, app.ws.active.transcript.messages.items[2].kind);
+    try std.testing.expectEqualStrings("Thinking...", app.ws.active.transcript.messages.items[2].title);
 }
 
 test "agent response after tool batch appears below tool rows" {
@@ -8370,15 +7830,15 @@ test "agent response after tool batch appears below tool rows" {
     try std.testing.expect(try app.applyAgentEvent(.tool_batch_finished));
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "The repo is in /tmp." }));
 
-    try std.testing.expectEqual(@as(usize, 4), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqual(.user, app.thread.transcript.messages.items[0].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[1].kind);
-    try std.testing.expectEqual(.tool, app.thread.transcript.messages.items[2].kind);
-    try std.testing.expectEqual(.agent, app.thread.transcript.messages.items[3].kind);
-    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
-    try std.testing.expectEqualStrings("The repo is in /tmp.", app.thread.transcript.messages.items[3].body);
-    try std.testing.expectEqual(@as(u32, 3), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(usize, 4), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqual(.user, app.ws.active.transcript.messages.items[0].kind);
+    try std.testing.expectEqual(.agent, app.ws.active.transcript.messages.items[1].kind);
+    try std.testing.expectEqual(.tool, app.ws.active.transcript.messages.items[2].kind);
+    try std.testing.expectEqual(.agent, app.ws.active.transcript.messages.items[3].kind);
+    try std.testing.expectEqualStrings("I will check.", app.ws.active.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.ws.active.transcript.messages.items[2].title);
+    try std.testing.expectEqualStrings("The repo is in /tmp.", app.ws.active.transcript.messages.items[3].body);
+    try std.testing.expectEqual(@as(u32, 3), app.ws.active.transcript.selected.?);
 }
 
 test "content delta after tool preview does not move selection away from tool row" {
@@ -8397,7 +7857,7 @@ test "content delta after tool preview does not move selection away from tool ro
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = "I will check." }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 1), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 1), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(!try app.applyAgentEvent(.{ .tool_delta = .{
         .index = 0,
@@ -8405,11 +7865,11 @@ test "content delta after tool preview does not move selection away from tool ro
         .arguments = "{\"command\":\"pwd\",\"reason\":\"Print working directory\"}",
     } }));
     try std.testing.expect(try app.applyAgentEvent(.delta_end));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .response_delta = " Still checking." }));
     _ = try app.applyAgentEvent(.delta_end);
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
 
     try std.testing.expect(try app.applyAgentEvent(.{ .tool_call_finished = .{
         .index = 0,
@@ -8418,10 +7878,10 @@ test "content delta after tool preview does not move selection away from tool ro
         .display_expanded_label = "pwd",
         .display_body = "$ pwd\nexit 0\nstdout:\n/tmp\nstderr:\n",
     } }));
-    try std.testing.expectEqual(@as(u32, 2), app.thread.transcript.selected.?);
-    try std.testing.expectEqualStrings("I will check.", app.thread.transcript.messages.items[1].body);
-    try std.testing.expectEqualStrings("🛠  Print working directory", app.thread.transcript.messages.items[2].title);
-    try std.testing.expectEqualStrings(" Still checking.", app.thread.transcript.messages.items[3].body);
+    try std.testing.expectEqual(@as(u32, 2), app.ws.active.transcript.selected.?);
+    try std.testing.expectEqualStrings("I will check.", app.ws.active.transcript.messages.items[1].body);
+    try std.testing.expectEqualStrings("🛠  Print working directory", app.ws.active.transcript.messages.items[2].title);
+    try std.testing.expectEqualStrings(" Still checking.", app.ws.active.transcript.messages.items[3].body);
 }
 
 test "collapsed thinking and tool rows have stable heights" {
@@ -8467,8 +7927,8 @@ test "resumed tool messages keep the tool icon" {
 
     try app.rebuildTranscriptFromAgent();
 
-    try std.testing.expectEqual(@as(usize, 1), app.thread.transcript.messages.items.len);
-    try std.testing.expectEqualStrings("🛠  zig build test", app.thread.transcript.messages.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), app.ws.active.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("🛠  zig build test", app.ws.active.transcript.messages.items[0].title);
 }
 
 test "collapsed tool messages render no body text" {
@@ -8530,10 +7990,10 @@ test "switching lanes is a no-op with a single lane" {
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), app.threads.items.len);
-    const before = app.thread;
+    try std.testing.expectEqual(@as(usize, 1), app.ws.lanes.items.len);
+    const before = app.ws.active;
     app.switchToNextLane();
-    try std.testing.expectEqual(before, app.thread);
+    try std.testing.expectEqual(before, app.ws.active);
 }
 
 const BenchResult = struct { allocs: usize, bytes: usize };
@@ -8546,14 +8006,14 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
 
     const body = "This is a paragraph of agent markdown that wraps across the\nterminal a few times so the row counting and render caches do real work.\n";
     var i: usize = 0;
-    while (i < n) : (i += 1) _ = try app.thread.transcript.append(gpa, .agent, "agent", body);
-    app.thread.transcript_view_width = 100;
-    app.thread.transcript_view_height = 40;
+    while (i < n) : (i += 1) _ = try app.ws.active.transcript.append(gpa, .agent, "agent", body);
+    app.ws.active.transcript_view_width = 100;
+    app.ws.active.transcript_view_height = 40;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
-    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: TranscriptWidget = .{ .app = &app, .thread = app.ws.active };
 
     const draw = struct {
         fn f(tw: *TranscriptWidget, ar: *std.heap.ArenaAllocator, c: *CountingAllocator) !void {

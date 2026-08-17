@@ -23,6 +23,7 @@ pub const terminal_markdown = @import("terminal_markdown");
 pub const logger = @import("logger");
 pub const runtime = @import("runtime.zig");
 pub const vcs = @import("vcs.zig");
+pub const workspace = @import("workspace.zig");
 pub const transcript = @import("transcript.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
