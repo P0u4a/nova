@@ -25,35 +25,28 @@ Run a shell command.
 # Sequential steps. Stop on first failure.
 npm run lint && npm test
 
-# Inspect a file or directory without dumping too much text.
-ls -la src && head -80 src/main.ts
+# Read a file, with line numbers.
+cat -n src/main.ts
 
-# Search text with ripgrep.
-rg -n "TODO" src
+# Read part of a large file.
+sed -n '120,180p' src/main.ts
 
-# Locate paths with fd when available, or shell globs for simple cases.
-fd main src
+# Inspect a directory.
+ls -la src
 
 # Summarize repository changes.
 git diff --stat && git status --short
 
-# Create or replace a file.
-cat <<'EOF' > main.ts
-const users = getUsers();
-console.log(users);
-EOF
-
-# Edit a file or run any Python — always through uv, always a quoted heredoc.
-uv run --project .nova python - <<'PY'
-from nova import edit
-edit("src/main.ts", "const users = getUsers();", "const users = await getUsers();")
-PY
+# Run the build and tests.
+npm run lint && npm test
 ```
+
+Use the `grep` tool to search contents and the `find` tool to locate files — both query a maintained index. Use `edit` and `write` to change files rather than `sed -i` or a redirect, so a bad match fails cleanly instead of corrupting the file.
 
 ## Pitfalls
 
 - `$var` unquoted splits on spaces and glob characters. Use `"$var"`.
 - `if [ -n $var ]` breaks when `$var` is empty. Use `if [ -n "$var" ]`.
-- `for f in $(ls *.rs)` breaks on spaces and newlines. Use shell globs or a small Python script.
+- `for f in $(ls *.rs)` breaks on spaces and newlines. Use shell globs instead.
 - `cd dir && cmd` resets next call. Use the `cwd` param.
 - `cmd 2>&1 > file` only sends stdout to the file. Use `cmd > file 2>&1`.

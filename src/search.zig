@@ -19,7 +19,7 @@ pub const Op = enum {
 
 const ops_names = [_][]const u8{ "find", "grep" };
 
-pub const ops_by_name = std.StaticStringMap(Op).initComptime(.{
+const ops_by_name = std.StaticStringMap(Op).initComptime(.{
     .{ "find", .find },
     .{ "grep", .grep },
 });
@@ -27,6 +27,10 @@ pub const ops_by_name = std.StaticStringMap(Op).initComptime(.{
 pub const Request = struct {
     op: Op,
     query: []const u8,
+    glob: ?[]const u8 = null,
+    regex: bool = false,
+    context: u32 = 0,
+    limit: u32 = page_size,
     cursor: ?[]const u8 = null,
 };
 
@@ -54,6 +58,7 @@ const FreeResultFn = *const fn (*c.FffResult) callconv(.c) void;
 const FreeGrepResultFn = *const fn (*c.FffGrepResult) callconv(.c) void;
 const FreeMixedSearchResultFn = *const fn (*c.FffMixedSearchResult) callconv(.c) void;
 const LiveGrepFn = *const fn (?*anyopaque, [*:0]const u8, u8, u64, u32, bool, u32, u32, u64, u32, u32, bool) callconv(.c) *c.FffResult;
+const MultiGrepFn = *const fn (?*anyopaque, [*:0]const u8, ?[*:0]const u8, u64, u32, bool, u32, u32, u64, u32, u32, bool) callconv(.c) *c.FffResult;
 const SearchMixedFn = *const fn (?*anyopaque, [*:0]const u8, ?[*:0]const u8, u32, u32, u32, i32, u32) callconv(.c) *c.FffResult;
 const IsScanningFn = *const fn (?*anyopaque) callconv(.c) bool;
 
@@ -65,6 +70,7 @@ const Api = struct {
     free_grep_result: FreeGrepResultFn,
     free_mixed_search_result: FreeMixedSearchResultFn,
     live_grep: LiveGrepFn,
+    multi_grep: ?MultiGrepFn,
     search_mixed: SearchMixedFn,
     is_scanning: IsScanningFn,
 
@@ -240,6 +246,7 @@ fn loadApi(gpa: std.mem.Allocator) !Api {
             .free_grep_result = lib.lookup(FreeGrepResultFn, "fff_free_grep_result") orelse return error.MissingSymbol,
             .free_mixed_search_result = lib.lookup(FreeMixedSearchResultFn, "fff_free_mixed_search_result") orelse return error.MissingSymbol,
             .live_grep = lib.lookup(LiveGrepFn, "fff_live_grep") orelse return error.MissingSymbol,
+            .multi_grep = lib.lookup(MultiGrepFn, "fff_multi_grep"),
             .search_mixed = lib.lookup(SearchMixedFn, "fff_search_mixed") orelse return error.MissingSymbol,
             .is_scanning = lib.lookup(IsScanningFn, "fff_is_scanning") orelse return error.MissingSymbol,
         };
@@ -259,8 +266,42 @@ fn runFffGrep(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyo
     const cursor = try parseCursorForRequest(request);
     const query_c = try toCString(gpa, request.query);
     defer gpa.free(query_c);
+    const limit = if (request.limit == 0) page_size else request.limit;
 
-    const ffi_result = api.live_grep(handle, query_c.ptr, 1, grep_max_file_size, 0, true, cursor.offset, page_size, 0, 0, 0, true);
+    const ffi_result = if (request.regex) blk: {
+        break :blk api.live_grep(
+            handle,
+            query_c.ptr,
+            1, // mode: regex
+            grep_max_file_size,
+            0,
+            true, // smart case
+            cursor.offset,
+            limit,
+            0,
+            request.context,
+            request.context,
+            true,
+        );
+    } else blk: {
+        const multi = api.multi_grep orelse return error.MissingSymbol;
+        const glob_c: ?[:0]u8 = if (request.glob) |glob| try toCString(gpa, glob) else null;
+        defer if (glob_c) |value| gpa.free(value);
+        break :blk multi(
+            handle,
+            query_c.ptr,
+            if (glob_c) |value| value.ptr else null,
+            grep_max_file_size,
+            0,
+            true, // smart case
+            cursor.offset,
+            limit,
+            0,
+            request.context,
+            request.context,
+            true,
+        );
+    };
     const grep_result = try unwrapHandle(c.FffGrepResult, api, ffi_result);
     defer api.free_grep_result(grep_result);
 
@@ -276,7 +317,8 @@ fn runFffFind(gpa: std.mem.Allocator, request: Request, api: *Api, handle: *anyo
     const query_c = try toCString(gpa, request.query);
     defer gpa.free(query_c);
 
-    const ffi_result = api.search_mixed(handle, query_c.ptr, null, 0, cursor.offset, page_size, 100, 3);
+    const limit = if (request.limit == 0) page_size else request.limit;
+    const ffi_result = api.search_mixed(handle, query_c.ptr, null, 0, cursor.offset, limit, 100, 3);
     const mixed_result = try unwrapHandle(c.FffMixedSearchResult, api, ffi_result);
     defer api.free_mixed_search_result(mixed_result);
     return formatFind(gpa, request, mixed_result);
@@ -290,11 +332,27 @@ fn formatGrep(gpa: std.mem.Allocator, request: Request, result: *c.FffGrepResult
     var index: u32 = 0;
     while (index < result.count) : (index += 1) {
         const item = &result.items[index];
-        try writer.print("{s}:{}:{s}\n", .{
-            spanOrEmpty(item.relative_path),
-            item.line_number,
-            spanOrEmpty(item.line_content),
-        });
+        const path = spanOrEmpty(item.relative_path);
+        if (item.context_before_count > 0) {
+            const first = item.line_number -| item.context_before_count;
+            var before: u32 = 0;
+            while (before < item.context_before_count) : (before += 1) {
+                try writer.print("{s}-{}- {s}\n", .{
+                    path,
+                    first + before,
+                    spanOrEmpty(item.context_before[before]),
+                });
+            }
+        }
+        try writer.print("{s}:{}: {s}\n", .{ path, item.line_number, spanOrEmpty(item.line_content) });
+        var after: u32 = 0;
+        while (after < item.context_after_count) : (after += 1) {
+            try writer.print("{s}-{}- {s}\n", .{
+                path,
+                item.line_number + after + 1,
+                spanOrEmpty(item.context_after[after]),
+            });
+        }
     }
     if (result.next_file_offset > 0) {
         const cursor = try encodeCursor(gpa, .{ .op = .grep, .offset = result.next_file_offset, .query_hash = hashQuery(request.query) });
@@ -330,7 +388,7 @@ fn formatFind(gpa: std.mem.Allocator, request: Request, result: *c.FffMixedSearc
 fn runFallback(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Request) !Result {
     assert(cwd.len > 0);
     assert(request.query.len > 0);
-    const command = try fallbackCommand(gpa, request.op, request.query);
+    const command = try fallbackCommand(gpa, request);
     defer gpa.free(command);
 
     var result = bash.run(gpa, io, cwd, command) catch |err| return fail(gpa, @errorName(err));
@@ -344,17 +402,64 @@ fn runFallback(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, request: Req
     };
 }
 
-fn fallbackCommand(gpa: std.mem.Allocator, op: Op, query: []const u8) ![]u8 {
-    const quoted = try quoteShell(gpa, query);
-    defer gpa.free(quoted);
-    return switch (op) {
-        .grep => std.fmt.allocPrint(gpa,
-            \\set -o pipefail; if command -v rg >/dev/null 2>&1; then rg --line-number --color never --no-heading -- {s} . | head -n 50; else grep -RInE --exclude-dir=.git -- {s} . | head -n 50; fi
-        , .{ quoted, quoted }),
-        .find => std.fmt.allocPrint(gpa,
-            \\set -o pipefail; {{ find . -mindepth 1 -type f -not -path './.git/*' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git/*' 2>/dev/null | sed 's|$|/|'; }} | grep -F -- {s} | head -n 50
-        , .{quoted}),
+fn fallbackCommand(gpa: std.mem.Allocator, request: Request) ![]u8 {
+    const limit = if (request.limit == 0) page_size else request.limit;
+    return switch (request.op) {
+        .grep => grepFallbackCommand(gpa, request, limit),
+        .find => blk: {
+            const quoted = try quoteShell(gpa, request.query);
+            defer gpa.free(quoted);
+            break :blk std.fmt.allocPrint(gpa,
+                \\set -o pipefail; {{ find . -mindepth 1 -type f -not -path './.git/*' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git/*' 2>/dev/null | sed 's|$|/|'; }} | grep -F -- {s} | head -n {d}
+            , .{ quoted, limit });
+        },
     };
+}
+
+fn grepFallbackCommand(gpa: std.mem.Allocator, request: Request, limit: u32) ![]u8 {
+    var needles: std.Io.Writer.Allocating = .init(gpa);
+    defer needles.deinit();
+    var patterns = std.mem.splitScalar(u8, request.query, '\n');
+    while (patterns.next()) |pattern| {
+        if (pattern.len == 0) continue;
+        const quoted = try quoteShell(gpa, pattern);
+        defer gpa.free(quoted);
+        try needles.writer.print(" -e {s}", .{quoted});
+    }
+
+    var options: std.Io.Writer.Allocating = .init(gpa);
+    defer options.deinit();
+    if (!request.regex) try options.writer.writeAll(" -F");
+    if (request.context > 0) try options.writer.print(" -C {d}", .{request.context});
+
+    const glob_filter: []u8 = if (request.glob) |glob| glob_blk: {
+        const quoted = try quoteShell(gpa, glob);
+        defer gpa.free(quoted);
+        break :glob_blk try std.fmt.allocPrint(gpa, " --glob {s}", .{quoted});
+    } else try gpa.alloc(u8, 0);
+    defer gpa.free(glob_filter);
+
+    // POSIX grep has no --glob; approximate it with --include, which understands
+    // the same basename patterns for the common `*.ext` case.
+    const include_filter: []u8 = if (request.glob) |glob| include_blk: {
+        const quoted = try quoteShell(gpa, glob);
+        defer gpa.free(quoted);
+        break :include_blk try std.fmt.allocPrint(gpa, " --include={s}", .{quoted});
+    } else try gpa.alloc(u8, 0);
+    defer gpa.free(include_filter);
+
+    return std.fmt.allocPrint(gpa,
+        \\set -o pipefail; if command -v rg >/dev/null 2>&1; then rg --line-number --color never --no-heading{s}{s}{s} -- . | head -n {d}; else grep -RIn --exclude-dir=.git{s}{s}{s} . | head -n {d}; fi
+    , .{
+        options.written(),
+        glob_filter,
+        needles.written(),
+        limit,
+        options.written(),
+        include_filter,
+        needles.written(),
+        limit,
+    });
 }
 
 fn formatFallbackSuccess(gpa: std.mem.Allocator, stdout: []const u8) !Result {

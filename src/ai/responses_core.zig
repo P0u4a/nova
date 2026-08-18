@@ -183,31 +183,7 @@ fn writeToolDefinition(gpa: std.mem.Allocator, writer: *std.Io.Writer, tool: too
 }
 
 fn writeParameters(writer: *std.Io.Writer, tool: tools_common.Tool) !void {
-    try writer.writeAll("{\"type\":\"object\",\"properties\":{");
-    for (tool.schema.properties, 0..) |prop, index| {
-        if (index > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
-        try writer.writeAll(":{\"type\":");
-        const kind: []const u8 = switch (prop.kind) {
-            .string => "string",
-            .integer => "integer",
-            .object => "object",
-            .boolean => "boolean",
-        };
-        try std.json.Stringify.value(kind, .{}, writer);
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(prop.description, .{}, writer);
-        try writer.writeByte('}');
-    }
-    try writer.writeAll("},\"required\":[");
-    var required_count: u32 = 0;
-    for (tool.schema.properties) |prop| {
-        if (!prop.required) continue;
-        if (required_count > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
-        required_count += 1;
-    }
-    try writer.writeAll("]}");
+    return tool.schema.writeJson(writer);
 }
 
 pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_config: ResponsesConfig, messages: []const ai.ChatMessage, tools_json: []const u8) !void {

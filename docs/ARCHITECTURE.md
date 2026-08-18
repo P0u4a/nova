@@ -11,8 +11,22 @@ We try to normalise the request to a shape that is most compatible with the targ
 Nova exposes the following tools:
 
 - `bash`
+- `edit`
+- `write`
+- `find`
+- `grep`
 
 `bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed.
+
+### File Editing
+
+The interface for `edit` and `write` is adapted from Pi. Supports batch write/edit.
+
+### Search
+
+`find` and `grep` are backed by [fff](https://github.com/dmtrKovalenko/fff) through its C ABI (`src/search.zig`).
+
+When the fff library isn't built or is still scanning, both degrade to `rg`/`grep`/`find` through bash (the agent is made aware of this).
 
 ## Steering
 

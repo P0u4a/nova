@@ -10,6 +10,10 @@ pub const Policy = struct {
 
 const entries = [_]struct { name: []const u8, policy: Policy }{
     .{ .name = "bash", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "edit", .policy = .{ .expand_by_default = true, .render = .diff } },
+    .{ .name = "write", .policy = .{ .expand_by_default = true, .render = .diff } },
+    .{ .name = "find", .policy = .{ .expand_by_default = false, .render = .plain } },
+    .{ .name = "grep", .policy = .{ .expand_by_default = false, .render = .plain } },
 };
 
 comptime {

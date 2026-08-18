@@ -352,3 +352,100 @@ test "executor rejected bash result is failed and model-facing" {
     try std.testing.expectEqualStrings("The tool call was rejected by the user for being unsafe. Try something else.", result.content);
     try std.testing.expectEqualStrings(result.content, result.display_body);
 }
+
+test "executor dispatches write then edit, reporting both channels" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const rel = ".zig-cache/executor-tools-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, rel);
+    const cwd = try std.fs.path.join(gpa, &.{ root, rel });
+    defer gpa.free(cwd);
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = cwd });
+
+    const calls = [_]ai.ToolCall{
+        .{
+            .call_id = try gpa.dupe(u8, "call_write"),
+            .name = try gpa.dupe(u8, "write"),
+            .arguments = try gpa.dupe(u8,
+                \\{"path":"greet.txt","content":"hello\nworld\n"}
+            ),
+        },
+        .{
+            .call_id = try gpa.dupe(u8, "call_edit"),
+            .name = try gpa.dupe(u8, "edit"),
+            .arguments = try gpa.dupe(u8,
+                \\{"path":"greet.txt","edits":[{"old_text":"world","new_text":"nova"}]}
+            ),
+        },
+        .{
+            .call_id = try gpa.dupe(u8, "call_bad_edit"),
+            .name = try gpa.dupe(u8, "edit"),
+            .arguments = try gpa.dupe(u8,
+                \\{"path":"greet.txt","edits":[{"old_text":"absent","new_text":"x"}]}
+            ),
+        },
+    };
+    defer for (calls) |call| {
+        gpa.free(call.call_id);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    };
+
+    const results = try executor.runAll(&calls, ToolCallObserver.noop);
+    defer {
+        for (results) |*r| r.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+
+    // write: succeeded, and its human channel is a diff.
+    try std.testing.expect(!results[0].failed);
+    try std.testing.expectEqualStrings("Write greet.txt", results[0].display_label);
+    try std.testing.expectEqual(tools.DisplayKind.diff, results[0].display_kind);
+
+    // edit: applied to what write just produced.
+    try std.testing.expect(!results[1].failed);
+    try std.testing.expectEqualStrings("Edit greet.txt", results[1].display_label);
+    try std.testing.expect(std.mem.indexOf(u8, results[1].content, "1 replacement(s)") != null);
+
+    // A failed edit is reported as failed with a corrective message, not a crash.
+    try std.testing.expect(results[2].failed);
+    try std.testing.expect(std.mem.indexOf(u8, results[2].content, "was not found") != null);
+
+    // The file on disk reflects both successful calls and none of the failed one.
+    const path = try std.fs.path.join(gpa, &.{ rel, "greet.txt" });
+    defer gpa.free(path);
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const content = try reader.interface.allocRemaining(gpa, .limited(4096));
+    defer gpa.free(content);
+    try std.testing.expectEqualStrings("hello\nnova\n", content);
+}
+
+test "executor reports an unknown tool without failing the batch" {
+    const gpa = std.testing.allocator;
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = "." });
+    const calls = [_]ai.ToolCall{.{
+        .call_id = try gpa.dupe(u8, "call_x"),
+        .name = try gpa.dupe(u8, "no_such_tool"),
+        .arguments = try gpa.dupe(u8, "{}"),
+    }};
+    defer for (calls) |call| {
+        gpa.free(call.call_id);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    };
+
+    const results = try executor.runAll(&calls, ToolCallObserver.noop);
+    defer {
+        for (results) |*r| r.deinit(gpa);
+        gpa.free(results);
+    }
+    try std.testing.expect(results[0].failed);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "unknown tool") != null);
+}

@@ -109,7 +109,84 @@ pub const Schema = struct {
         required: bool,
     };
 
-    pub const Kind = enum { string, integer, object, boolean };
+    /// A parameter's JSON type. Arrays carry their element shape so a tool can
+    /// declare a list of strings (`grep`'s patterns) or a list of records
+    /// (`edit`'s replacements) without hand-writing JSON Schema.
+    pub const Kind = union(enum) {
+        string,
+        integer,
+        object,
+        boolean,
+        string_array,
+        /// Array of objects with these fields. Nested fields may not themselves
+        /// be arrays — one level is all any tool needs, and the writer below
+        /// asserts it rather than silently emitting a wrong schema.
+        object_array: []const Property,
+    };
+
+    /// Write this schema as a JSON Schema `object` — the `parameters` value every
+    /// provider expects. Shared by the adapters so the wire format can't drift
+    /// between them, and so array support only had to be written once.
+    pub fn writeJson(self: Schema, writer: *std.Io.Writer) !void {
+        try writer.writeAll("{\"type\":\"object\",\"properties\":{");
+        for (self.properties, 0..) |property, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writeProperty(writer, property, true);
+        }
+        try writer.writeAll("},\"required\":[");
+        var required: u32 = 0;
+        for (self.properties) |property| {
+            if (!property.required) continue;
+            if (required > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(property.name, .{}, writer);
+            required += 1;
+        }
+        try writer.writeAll("]}");
+    }
+
+    fn writeProperty(writer: *std.Io.Writer, property: Property, comptime nestable: bool) !void {
+        try std.json.Stringify.value(property.name, .{}, writer);
+        try writer.writeAll(":");
+        switch (property.kind) {
+            .string, .integer, .object, .boolean => {
+                try writer.writeAll("{\"type\":");
+                try std.json.Stringify.value(scalarTypeName(property.kind), .{}, writer);
+            },
+            .string_array => {
+                try writer.writeAll("{\"type\":\"array\",\"items\":{\"type\":\"string\"}");
+            },
+            .object_array => |fields| {
+                if (!nestable) unreachable; // one level of nesting only
+                try writer.writeAll("{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{");
+                for (fields, 0..) |field, index| {
+                    if (index > 0) try writer.writeByte(',');
+                    try writeProperty(writer, field, false);
+                }
+                try writer.writeAll("},\"required\":[");
+                var required: u32 = 0;
+                for (fields) |field| {
+                    if (!field.required) continue;
+                    if (required > 0) try writer.writeByte(',');
+                    try std.json.Stringify.value(field.name, .{}, writer);
+                    required += 1;
+                }
+                try writer.writeAll("]}");
+            },
+        }
+        try writer.writeAll(",\"description\":");
+        try std.json.Stringify.value(property.description, .{}, writer);
+        try writer.writeByte('}');
+    }
+
+    fn scalarTypeName(kind: Kind) []const u8 {
+        return switch (kind) {
+            .string => "string",
+            .integer => "integer",
+            .object => "object",
+            .boolean => "boolean",
+            .string_array, .object_array => unreachable,
+        };
+    }
 };
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {

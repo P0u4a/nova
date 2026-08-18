@@ -247,31 +247,9 @@ fn writeToolDefinition(
     try std.json.Stringify.value(tool.name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(description, .{}, writer);
-    try writer.writeAll(",\"parameters\":{\"type\":\"object\",\"properties\":{");
-    for (tool.schema.properties, 0..) |prop, p| {
-        if (p > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
-        try writer.writeAll(":{\"type\":");
-        const kind_str: []const u8 = switch (prop.kind) {
-            .string => "string",
-            .integer => "integer",
-            .object => "object",
-            .boolean => "boolean",
-        };
-        try std.json.Stringify.value(kind_str, .{}, writer);
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(prop.description, .{}, writer);
-        try writer.writeByte('}');
-    }
-    try writer.writeAll("},\"required\":[");
-    var written_required: u32 = 0;
-    for (tool.schema.properties) |prop| {
-        if (!prop.required) continue;
-        if (written_required > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(prop.name, .{}, writer);
-        written_required += 1;
-    }
-    try writer.writeAll("]}}}");
+    try writer.writeAll(",\"parameters\":");
+    try tool.schema.writeJson(writer);
+    try writer.writeAll("}}");
 }
 
 fn writeMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {

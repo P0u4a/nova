@@ -6,7 +6,6 @@ const agent_mod = @import("agent.zig");
 const ai = @import("ai.zig");
 const at_mention = @import("at_mention.zig");
 const background_mod = @import("background.zig");
-const pytools = @import("pytools.zig");
 const bash_mod = @import("bash.zig");
 const search_mod = @import("search.zig");
 const codex = @import("codex.zig");
@@ -304,10 +303,11 @@ pub const App = struct {
         manager.* = .init(io, gpa);
         app.ws.background = manager;
         runtime.agent.background_manager = manager;
-        // Materialize the project-scoped Python helper package (`.nova/`) so the
-        // model's `uv run --project .nova` invocations find it. Best-effort —
-        // a failure only degrades the python workflow, never blocks startup.
-        pytools.ensureInstalled(gpa, io, runtime.agent.cwd) catch {};
+        // Start indexing the project immediately. The `find`/`grep` tools and the
+        // `@` mention popup both read this index, and it is only useful once it is
+        // warm — waiting until first use would make the agent's first few searches
+        // fall back to the shell. Async, so startup is not blocked.
+        search_mod.start(std.heap.smp_allocator, io, runtime.agent.cwd);
         app.ws.active.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
         app.ws.active.id = runtime.session_writer.session.id;
         app.codex_signed_in = !runtime.codex_connection_expired and
@@ -7905,7 +7905,7 @@ test "collapsed tool title wraps to visible rows" {
     var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
 
-    const index = try transcript.startTool(gpa, "python3 - <<'PY'\nprint('a very long patch document')\nPY");
+    const index = try transcript.startTool(gpa, "cat <<'EOF' >> notes.md\na very long appended document\nEOF");
     try std.testing.expect(!transcript.messages.items[index].expanded);
     try std.testing.expect(messageRowsCached(&transcript.messages.items[index], 12) > 3);
 }

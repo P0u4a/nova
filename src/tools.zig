@@ -2,6 +2,10 @@ const std = @import("std");
 
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
+const edit_text = @import("tools/edit_text.zig");
+const edit_tool = @import("tools/edit.zig");
+const write_tool = @import("tools/write.zig");
+const search_tools = @import("tools/search_tools.zig");
 
 const assert = std.debug.assert;
 
@@ -12,13 +16,12 @@ pub const Tool = common.Tool;
 pub const Schema = common.Schema;
 pub const ToolDisplay = common.ToolDisplay;
 
-/// The Tool registry — single source of truth for the native tools that exist.
-/// Consumed by `ExecutorService` (for dispatch) and by each `LanguageModel`
-/// adapter (for building its provider-specific tools schema). Bash is the only
-/// tool: everything richer (edits, search, reusable helpers) is Python run
-/// through it — see `src/py/` and the system prompt.
 pub const registry: []const Tool = &.{
     bash_tool.tool,
+    edit_tool.tool,
+    write_tool.tool,
+    search_tools.find_tool,
+    search_tools.grep_tool,
 };
 
 pub fn run(
@@ -54,7 +57,35 @@ test "registry contains every tool exactly once" {
         const gop = try seen.getOrPut(std.testing.allocator, tool.name);
         try std.testing.expect(!gop.found_existing);
     }
-    try std.testing.expectEqual(@as(usize, 1), registry.len);
+}
+
+test "every registered tool declares a name, description, and schema" {
+    for (registry) |tool| {
+        try std.testing.expect(tool.name.len > 0);
+        try std.testing.expect(tool.description.len > 0);
+        for (tool.schema.properties) |property| {
+            try std.testing.expect(property.name.len > 0);
+            try std.testing.expect(property.description.len > 0);
+        }
+    }
+}
+
+test "every registered tool serializes to valid JSON Schema" {
+    const gpa = std.testing.allocator;
+    for (registry) |tool| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try tool.schema.writeJson(&out.writer);
+        const json = out.written();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const kind = parsed.value.object.get("type") orelse return error.TestFailed;
+        try std.testing.expectEqualStrings("object", kind.string);
+        try std.testing.expect(parsed.value.object.get("properties") != null);
+        try std.testing.expect(parsed.value.object.get("required") != null);
+    }
 }
 
 test "lookup finds a registered tool" {
@@ -68,5 +99,9 @@ test "lookup returns null for unknown tool" {
 
 test {
     _ = bash_tool;
+    _ = edit_text;
+    _ = edit_tool;
+    _ = write_tool;
+    _ = search_tools;
     _ = common;
 }
