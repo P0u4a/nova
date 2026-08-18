@@ -10,8 +10,11 @@ const background_mod = @import("background.zig");
 const config_mod = @import("config.zig");
 const naming_mod = @import("tui/naming.zig");
 const runtime_mod = @import("runtime.zig");
+const session_mod = @import("session.zig");
 const vcs = @import("vcs.zig");
 const Thread = @import("tui/thread.zig");
+
+const git_test = @import("testing/git.zig");
 
 const assert = std.debug.assert;
 
@@ -340,6 +343,7 @@ pub const Workspace = struct {
         }
         defer if (branch) |b| self.gpa.free(b);
         defer if (dir) |d| self.gpa.free(d);
+        const session = lane.id;
 
         self.cancelNaming(lane);
         _ = self.lanes.orderedRemove(index);
@@ -349,6 +353,7 @@ pub const Workspace = struct {
         if (self.repoRoot()) |repo| {
             if (dir) |d| vcs.worktreeRemove(self.gpa, self.io, repo, d) catch {};
             if (branch) |b| vcs.deleteBranch(self.gpa, self.io, repo, b) catch {};
+            if (session) |id| self.dropSnapshotChain(repo, id);
         }
     }
 
@@ -408,6 +413,11 @@ pub const Workspace = struct {
         const repo = self.repoRoot() orelse return;
         vcs.worktreeRemove(self.gpa, self.io, repo, entry.path) catch {};
         vcs.deleteBranch(self.gpa, self.io, repo, entry.branch) catch {};
+    }
+
+    fn dropSnapshotChain(self: *Workspace, repo: []const u8, session_id: session_mod.SessionId) void {
+        const id = session_id;
+        vcs.dropSessionRefs(self.gpa, self.io, repo, id.slice()) catch {};
     }
 
     pub fn activeLaneDirty(self: *Workspace) bool {
@@ -628,6 +638,80 @@ test "parking a lane drops it and lands on the previous one" {
     try std.testing.expectEqual(@as(usize, 1), workspace.activeIndex());
 
     try workspace.closeActiveLane();
+    try std.testing.expectEqual(@as(usize, 1), workspace.lanes.items.len);
+    try std.testing.expectEqual(primary, workspace.active);
+}
+
+// Abandoning a lane deletes git state, so this pins down *which* state: the
+// abandoned lane's snapshot chain goes, and every other session's stays. Getting
+// that wrong would silently destroy another conversation's code history, which no
+// amount of reading the call site proves.
+test "abandoning a lane releases only its own snapshot chain" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+
+    var repo = try git_test.TempRepo.init(gpa, io, "nova-abandon");
+    defer repo.deinit();
+
+    // A real runtime for the primary lane, so `repoRoot()` resolves and the
+    // ref-dropping path actually runs. `.none` client: no network, no provider.
+    const diagnostics = try gpa.alloc(config_mod.Diagnostic, 0);
+    var primary_rt: runtime_mod.AgentRuntime = undefined;
+    try primary_rt.initNew(
+        gpa,
+        io,
+        repo.path, // cwd
+        repo.path, // session_dir
+        repo.path, // home_dir — keeps the session DB inside the throwaway repo
+        "test system prompt",
+        .{},
+        diagnostics,
+        null,
+    );
+    defer primary_rt.deinit();
+
+    const primary = try gpa.create(Thread);
+    primary.* = .{
+        .id = primary_rt.session_writer.session.id,
+        .agent = &primary_rt.agent,
+        // `owns = false`: this runtime is the test's, freed by the defer above.
+        .engine = .{ .live = .{ .lane = .primary, .runtime = &primary_rt, .owns = false } },
+    };
+    var workspace = try Workspace.init(gpa, io, primary);
+    defer workspace.deinit();
+
+    // A doomed lane with its own session id, parked on its own branch.
+    const doomed_session = try session_mod.SessionId.fromSlice("a" ** 32);
+    const doomed = try gpa.create(Thread);
+    doomed.* = .{
+        .id = doomed_session,
+        .engine = .{ .idle = .{ .working = .{
+            .branch = try gpa.dupe(u8, "nova/doomed"),
+            .path = try gpa.dupe(u8, "nova-abandon-no-such-worktree"),
+        } } },
+    };
+    try workspace.lanes.append(gpa, doomed);
+
+    // Pin a snapshot under each session, so both namespaces are non-empty.
+    const index = try repo.indexPath();
+    defer gpa.free(index);
+    try repo.writeFile("tracked.txt", "content\n");
+    const commit = try vcs.snapshot(gpa, io, repo.path, index, null);
+
+    var primary_session = primary_rt.session_writer.session.id;
+    try vcs.keepRef(gpa, io, repo.path, primary_session.slice(), "keepmine", commit);
+    var doomed_id = doomed_session;
+    try vcs.keepRef(gpa, io, repo.path, doomed_id.slice(), "dropme", commit);
+    try std.testing.expectEqual(@as(usize, 1), try repo.sessionRefCount(primary_session.slice()));
+    try std.testing.expectEqual(@as(usize, 1), try repo.sessionRefCount(doomed_id.slice()));
+
+    try workspace.abandonLane(1);
+
+    // The abandoned lane's chain is released; the primary's is untouched.
+    try std.testing.expectEqual(@as(usize, 0), try repo.sessionRefCount(doomed_id.slice()));
+    try std.testing.expectEqual(@as(usize, 1), try repo.sessionRefCount(primary_session.slice()));
+    // And the lane itself is gone from the workspace.
     try std.testing.expectEqual(@as(usize, 1), workspace.lanes.items.len);
     try std.testing.expectEqual(primary, workspace.active);
 }
