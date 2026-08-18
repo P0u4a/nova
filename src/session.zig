@@ -274,11 +274,15 @@ pub const Session = struct {
         try expectDone(&statement);
     }
 
-    /// The git commit id of the nearest entry at or above the current leaf that
-    /// carries a snapshot (walking leaf→root) — the code state bound to the
-    /// active conversation position. Null when no ancestor has one (a brand-new
-    /// session before any file change). Caller owns the returned string.
-    pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?[]u8 {
+    /// The snapshot bound to the active conversation position: the nearest entry
+    /// at or above the leaf that carries one, walking leaf→root. Null when no
+    /// ancestor has one (a brand-new session before any file change).
+    ///
+    /// `entry_id` is returned alongside the sha because that entry names the ref
+    /// currently pinning this snapshot (`refs/nova/<session>/<entry>`) — chaining
+    /// a new snapshot onto it makes that ref redundant, and the caller needs the
+    /// id to drop it. Caller owns `sha`.
+    pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?SnapshotBinding {
         const leaf_id = self.leaf_entry_id orelse return null;
         var statement = try self.manager.connection.prepare(
             \\with recursive anc(id, parent_id, snapshot, depth) as (
@@ -289,14 +293,15 @@ pub const Session = struct {
             \\    from session_entries e join anc on e.id = anc.parent_id
             \\    where e.session_id = ?1
             \\)
-            \\select snapshot from anc where snapshot is not null order by depth limit 1
+            \\select id, snapshot from anc where snapshot is not null order by depth limit 1
         );
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
         try statement.bindText(2, leaf_id.slice());
         const row = (try statement.step()) orelse return null;
-        if (row.columnType(0) == .null) return null;
-        return try gpa.dupe(u8, row.text(0));
+        if (row.columnType(1) == .null) return null;
+        const entry_id = try EntryId.fromSlice(row.text(0));
+        return .{ .entry_id = entry_id, .sha = try gpa.dupe(u8, row.text(1)) };
     }
 
     /// Project the active branch into the message list the model sees. The
@@ -610,9 +615,9 @@ pub const SessionWriter = struct {
         return self.session.setSnapshot(leaf_id, sha);
     }
 
-    /// Race-free `Session.snapshotAt`: the git snapshot bound to the active
+    /// Race-free `Session.snapshotAt`: the snapshot bound to the active
     /// conversation position (nearest entry at/above the leaf). Caller owns it.
-    pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?[]u8 {
+    pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?SnapshotBinding {
         self.quiesce();
         defer self.restart() catch {};
         return self.session.snapshotAt(gpa);
@@ -1055,6 +1060,19 @@ fn compactionSummaryText(gpa: std.mem.Allocator, payload_json: []const u8) Error
 
 /// Result of `compactionCut`: which entry stays as the first kept message, and
 /// the rendered prefix text to summarize. Caller owns `prefix_text`.
+/// A snapshot resolved from the tree: the git commit id, plus the entry that
+/// carries it. The entry id matters as much as the sha — it names the ref
+/// pinning this snapshot, so a caller chaining onto it knows which ref to drop.
+pub const SnapshotBinding = struct {
+    entry_id: EntryId,
+    /// git commit id. Owned by the caller.
+    sha: []u8,
+
+    pub fn deinit(self: *SnapshotBinding, gpa: std.mem.Allocator) void {
+        gpa.free(self.sha);
+        self.* = undefined;
+    }
+};
 pub const CompactionCut = struct {
     first_kept_id: [entry_id_len]u8,
     prefix_text: []u8,
@@ -1485,27 +1503,32 @@ test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
     try session.setSnapshot(user_id[0..], sha_a);
     try appendTextEntry(&session, gpa, .assistant, "second", &asst_id);
 
-    // a1 carries no snapshot → nearest ancestor (u1) wins.
+    // a1 carries no snapshot → nearest ancestor (u1) wins, and the binding names
+    // u1 as the entry holding it (that entry names the pinning ref).
     {
-        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer gpa.free(got);
-        try std.testing.expectEqualStrings(sha_a, got);
+        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer got.deinit(gpa);
+        try std.testing.expectEqualStrings(sha_a, got.sha);
+        try std.testing.expectEqualStrings(user_id[0..], got.entry_id.slice());
     }
     // Annotate the assistant entry → self wins.
     try session.setSnapshot(asst_id[0..], sha_b);
     {
-        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer gpa.free(got);
-        try std.testing.expectEqualStrings(sha_b, got);
+        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer got.deinit(gpa);
+        try std.testing.expectEqualStrings(sha_b, got.sha);
+        try std.testing.expectEqualStrings(asst_id[0..], got.entry_id.slice());
     }
     // Fork off u1: the new branch's leaf has no snapshot, so it inherits u1's —
     // never a1's (which is on the other branch). This is the binding that the
-    // old descendant-checkpoint model got wrong.
+    // old descendant-checkpoint model got wrong, and it is also what makes the
+    // snapshot chain fork where the conversation forks.
     try session.branch(user_id[0..], null, null);
     try appendTextEntry(&session, gpa, .user, "alt", &scratch);
     {
-        const got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer gpa.free(got);
-        try std.testing.expectEqualStrings(sha_a, got);
+        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
+        defer got.deinit(gpa);
+        try std.testing.expectEqualStrings(sha_a, got.sha);
+        try std.testing.expectEqualStrings(user_id[0..], got.entry_id.slice());
     }
 }

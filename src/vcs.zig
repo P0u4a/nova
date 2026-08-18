@@ -4,13 +4,28 @@
 //! user's branch and no automation commit ever lands on it:
 //!
 //!   - A snapshot stages the whole working tree into a **dedicated index**
-//!     (never the user's `.git/index`), writes a tree, and wraps it in a
-//!     **parentless commit**. `git log`, `git status`, and `git branch` are
-//!     untouched — the snapshot is reachable only through `refs/nova/*`.
+//!     (never the user's `.git/index`), writes a tree, and commits it **off
+//!     branch**. `git log`, `git status`, and `git branch` are untouched — the
+//!     commit is reachable only through `refs/nova/*`.
 //!   - Restoring a snapshot rewrites the working tree to that tree (adds,
 //!     modifies, AND deletes tracked files), again without moving HEAD.
 //!   - `git add -A` honors `.gitignore`, so build artifacts stay out of
 //!     snapshots and are never clobbered on restore.
+//!
+//! ## Snapshots chain
+//!
+//! Each snapshot's parent is the previous snapshot on its timeline, so a
+//! timeline's snapshots form a chain and its tip reaches all of them. That means
+//! **one ref per timeline tip** keeps everything alive, rather than one ref per
+//! snapshot — see `commitTree` and `keepRef`. The chain forks wherever the
+//! conversation forks, because a new snapshot's parent is resolved from the
+//! conversation's current position (`Session.snapshotAt`), not from wherever the
+//! process last wrote.
+//!
+//! The chain connects only to itself: no branch ref ever points into it, so the
+//! "HEAD stays clean" guarantee above is unaffected. The cost of chaining is that
+//! an individual mid-chain snapshot can no longer be released on its own —
+//! retention is per-timeline truncation, not per-entry deletion.
 //!
 //! The anchor between a conversation node and its code is a git **commit SHA**
 //! (an `ObjectId`), stored on the session entry. Snapshots are immutable and
@@ -21,6 +36,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const assert = std.debug.assert;
+
+/// Test-only. Referenced solely from `test` blocks, so a normal build never
+/// analyzes it.
+const git_test = @import("testing/git.zig");
 
 pub const Error = error{BadObjectId};
 
@@ -267,13 +286,20 @@ pub fn indexPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) CmdError![
 
 /// Snapshot the working tree of `dir` into an off-branch commit and return its
 /// id. Stages every non-ignored path into the dedicated index (`git add -A`
-/// honors `.gitignore`), writes the tree, and wraps it in a parentless commit.
-/// HEAD, the user's index, and branch refs are untouched. Identical working
-/// trees produce identical *tree* objects (content-addressed dedup); only the
-/// tiny commit object is new. `index_path` comes from `indexPath`.
-pub fn snapshot(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_path: []const u8) CmdError!ObjectId {
+/// honors `.gitignore`), writes the tree, and commits it with `parent` as its
+/// only parent — null only for the first snapshot on a timeline. HEAD, the
+/// user's index, and branch refs are untouched. Identical working trees produce
+/// identical *tree* objects (content-addressed dedup); only the tiny commit
+/// object is new. `index_path` comes from `indexPath`.
+pub fn snapshot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    index_path: []const u8,
+    parent: ?ObjectId,
+) CmdError!ObjectId {
     const tree = try workingTreeId(gpa, io, dir, index_path);
-    return commitTree(gpa, io, dir, tree);
+    return commitTree(gpa, io, dir, tree, parent);
 }
 
 /// Reconcile the dedicated index with the working tree (adds new, updates
@@ -294,20 +320,49 @@ pub fn workingTreeId(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, index_
     return ObjectId.parse(tree_raw);
 }
 
-/// Wrap `tree` in a parentless commit and return its id. `-c user.*` avoids
-/// depending on the user having a git identity configured (snapshots are
-/// Nova's, not the user's — unlike `/save`'s real commit).
-pub fn commitTree(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, tree: ObjectId) CmdError!ObjectId {
-    const commit_raw = try runOut(gpa, io, dir, &.{
+/// Commit `tree` off-branch and return the commit id. `parent`, when given,
+/// becomes the commit's only parent, chaining this snapshot onto the previous one
+/// for the same timeline; null starts a fresh chain.
+///
+/// Chaining is what keeps the ref count down: because a snapshot reaches every
+/// earlier snapshot on its timeline, one ref at the tip keeps the whole chain
+/// alive, instead of one ref per snapshot. The chain is still entirely
+/// off-branch — no branch ref ever points into it, so `git log`, `git status`,
+/// and `git branch` stay clean.
+///
+/// `-c user.*` avoids depending on the user having a git identity configured
+/// (snapshots are Nova's, not the user's — unlike `/save`'s real commit).
+pub fn commitTree(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    tree: ObjectId,
+    parent: ?ObjectId,
+) CmdError!ObjectId {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{
         "-c",          "user.name=nova",
         "-c",          "user.email=nova@local",
         "commit-tree", tree.slice(),
-        "-m",          "nova snapshot",
-    }, null);
+    });
+    if (parent) |p| try argv.appendSlice(gpa, &.{ "-p", p.slice() });
+    try argv.appendSlice(gpa, &.{ "-m", "nova snapshot" });
+
+    const commit_raw = try runOut(gpa, io, dir, argv.items, null);
     defer gpa.free(commit_raw);
     return ObjectId.parse(commit_raw);
 }
 
+/// The tree a snapshot commit points at. Callers that already know a commit and
+/// need its content identity use this instead of re-staging the working tree.
+pub fn treeOf(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: ObjectId) CmdError!ObjectId {
+    const spec = std.fmt.allocPrint(gpa, "{s}^{{tree}}", .{rev.slice()}) catch return error.OutOfMemory;
+    defer gpa.free(spec);
+    const raw = try runOut(gpa, io, dir, &.{ "rev-parse", spec }, null);
+    defer gpa.free(raw);
+    return ObjectId.parse(raw);
+}
 /// Rewrite the working tree of `dir` to match `rev`'s tree — adding, modifying,
 /// and **deleting** tracked files as needed — without moving HEAD. Ignored
 /// files are left alone. Used by timeline navigation to restore the code state
@@ -449,25 +504,84 @@ pub fn freeWorktreeList(gpa: std.mem.Allocator, entries: []WorktreeEntry) void {
     gpa.free(entries);
 }
 
-/// Point a `refs/nova/<name>` ref at `sha` so the snapshot survives `git gc`.
-/// `name` must be a ref-safe path segment (the caller passes a session/entry id).
-pub fn keepRef(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: ObjectId) CmdError!void {
-    const ref = std.fmt.allocPrint(gpa, "refs/nova/{s}", .{name}) catch return error.OutOfMemory;
+/// The ref namespace that keeps snapshots alive: `refs/nova/<session>/<entry>`.
+///
+/// Namespaced by session because refs are repo-global while entry ids are only
+/// unique within a session — two sessions in one repo would otherwise collide on
+/// an 8-hex-char name and silently clobber each other's snapshots. Caller owns
+/// the returned string.
+fn snapshotRefName(
+    gpa: std.mem.Allocator,
+    session_id: []const u8,
+    entry_id: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    assert(session_id.len > 0);
+    assert(entry_id.len > 0);
+    return std.fmt.allocPrint(gpa, "refs/nova/{s}/{s}", .{ session_id, entry_id });
+}
+
+/// Point `refs/nova/<session_id>/<entry_id>` at `sha` so the snapshot — and,
+/// because snapshots chain, every snapshot before it on this timeline — survives
+/// `git gc`. Both ids must be ref-safe path segments; callers pass session and
+/// entry ids, which are hex.
+pub fn keepRef(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    session_id: []const u8,
+    entry_id: []const u8,
+    sha: ObjectId,
+) CmdError!void {
+    const ref = snapshotRefName(gpa, session_id, entry_id) catch return error.OutOfMemory;
     defer gpa.free(ref);
     var out = try run(gpa, io, dir, &.{ "update-ref", ref, sha.slice() }, null);
     defer out.deinit(gpa);
     if (out.code != 0) return error.GitCommandFailed;
 }
 
-/// Drop a `refs/nova/<name>` ref (e.g. when pruning an abandoned timeline
-/// branch). The underlying objects become unreachable and are collected by a
-/// later `git gc`. Missing ref is not an error.
-pub fn dropRef(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) CmdError!void {
-    const ref = std.fmt.allocPrint(gpa, "refs/nova/{s}", .{name}) catch return error.OutOfMemory;
+/// Drop `refs/nova/<session_id>/<entry_id>`.
+///
+/// Safe when the snapshot it names is reachable from a newer ref — which is the
+/// normal case now that snapshots chain: extending a timeline makes the previous
+/// tip an ancestor of the new one, so its own ref is redundant. Otherwise the
+/// objects become unreachable and a later `git gc` collects them (how an
+/// abandoned timeline is pruned). A missing ref is not an error.
+pub fn dropRef(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    session_id: []const u8,
+    entry_id: []const u8,
+) CmdError!void {
+    const ref = snapshotRefName(gpa, session_id, entry_id) catch return error.OutOfMemory;
     defer gpa.free(ref);
     var out = try run(gpa, io, dir, &.{ "update-ref", "-d", ref }, null);
     defer out.deinit(gpa);
     // `update-ref -d` on a missing ref exits non-zero; treat that as success.
+}
+
+/// Delete every `refs/nova/<session_id>/*` ref, releasing that session's whole
+/// snapshot chain to a later `git gc`. For discarding a session's code history
+/// wholesale — an abandoned lane, a deleted session. Best-effort.
+pub fn dropSessionRefs(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    session_id: []const u8,
+) CmdError!void {
+    assert(session_id.len > 0);
+    const prefix = std.fmt.allocPrint(gpa, "refs/nova/{s}", .{session_id}) catch return error.OutOfMemory;
+    defer gpa.free(prefix);
+    const listing = try runOut(gpa, io, dir, &.{ "for-each-ref", "--format=%(refname)", prefix }, null);
+    defer gpa.free(listing);
+
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        const ref = std.mem.trim(u8, line, " \t\r");
+        if (ref.len == 0) continue;
+        var out = try run(gpa, io, dir, &.{ "update-ref", "-d", ref }, null);
+        out.deinit(gpa);
+    }
 }
 
 test "ObjectId.parse accepts 40/64 lowercase hex, trims, rejects the rest" {
@@ -496,85 +610,111 @@ test "git shadow: snapshot ignores artifacts, restore adds/deletes, HEAD stays c
     const io = std.testing.io;
     if (!isAvailable(gpa, io)) return error.SkipZigTest;
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-vcstest-{s}", .{hex[0..]});
-    defer gpa.free(name);
+    var repo = try git_test.TempRepo.init(gpa, io, "nova-vcstest");
+    defer repo.deinit();
 
-    try std.Io.Dir.cwd().createDirPath(io, name);
-    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
-
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
-    defer gpa.free(repo);
-
-    // init + a baseline commit so HEAD is attached to a branch.
-    try expectOk(gpa, io, repo, &.{ "init", "-q" });
-    try expectOk(gpa, io, repo, &.{ "config", "core.autocrlf", "false" });
-    try expectOk(gpa, io, repo, &.{ "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "baseline" });
-
-    const head_before = try runOut(gpa, io, repo, &.{ "rev-parse", "HEAD" }, null);
-    defer gpa.free(head_before);
-
-    const index = try indexPath(gpa, io, repo);
+    const index = try repo.indexPath();
     defer gpa.free(index);
 
     // `.gitignore` excludes build output; write a tracked file + an ignored one.
-    try writeFileRel(io, name, ".gitignore", "build/\n");
-    try writeFileRel(io, name, "a.txt", "A\n");
-    try writeFileRel(io, name, "build/x", "junk\n");
+    try repo.writeFile(".gitignore", "build/\n");
+    try repo.writeFile("a.txt", "A\n");
+    try repo.writeFile("build/x", "junk\n");
 
-    const s1 = try snapshot(gpa, io, repo, index);
+    const s1 = try snapshot(gpa, io, repo.path, index, null);
     // The ignored file must NOT be in the snapshot tree; the tracked one must be.
     {
-        const listing = try runOut(gpa, io, repo, &.{ "ls-tree", "-r", "--name-only", s1.slice() }, null);
+        const listing = try repo.lsTree(s1.slice());
         defer gpa.free(listing);
         try std.testing.expect(std.mem.indexOf(u8, listing, "a.txt") != null);
         try std.testing.expect(std.mem.indexOf(u8, listing, "build/x") == null);
     }
 
     // Second snapshot: delete a.txt, add b.txt — a different tree.
-    const a_path = try std.fs.path.join(gpa, &.{ name, "a.txt" });
-    defer gpa.free(a_path);
-    try std.Io.Dir.cwd().deleteFile(io, a_path);
-    try writeFileRel(io, name, "b.txt", "B\n");
-    const s2 = try snapshot(gpa, io, repo, index);
-    try std.testing.expect(!(try treeOf(gpa, io, repo, s1)).eql(try treeOf(gpa, io, repo, s2)));
+    try repo.deleteFile("a.txt");
+    try repo.writeFile("b.txt", "B\n");
+    const s2 = try snapshot(gpa, io, repo.path, index, s1);
+    try std.testing.expect(!(try treeOf(gpa, io, repo.path, s1)).eql(try treeOf(gpa, io, repo.path, s2)));
 
     // Restore s1, then re-snapshot the worktree: matching trees proves the
     // working copy was rewritten exactly to s1 (a.txt re-added, b.txt deleted).
-    try restore(gpa, io, repo, index, s1);
-    const after = try snapshot(gpa, io, repo, index);
-    try std.testing.expect((try treeOf(gpa, io, repo, after)).eql(try treeOf(gpa, io, repo, s1)));
+    try restore(gpa, io, repo.path, index, s1);
+    const after = try snapshot(gpa, io, repo.path, index, s2);
+    try std.testing.expect((try treeOf(gpa, io, repo.path, after)).eql(try treeOf(gpa, io, repo.path, s1)));
 
     // showFile reads a path out of a snapshot without touching the worktree.
     {
-        const content = try showFile(gpa, io, repo, s1.slice(), "a.txt");
+        const content = try showFile(gpa, io, repo.path, s1.slice(), "a.txt");
         defer gpa.free(content);
         try std.testing.expectEqualStrings("A\n", content);
     }
 
-    // keepRef makes a snapshot survive an aggressive gc; dropRef lets it go.
-    try keepRef(gpa, io, repo, name, s1);
-    try expectOk(gpa, io, repo, &.{ "gc", "--prune=now", "-q" });
-    {
-        const kept = try runOut(gpa, io, repo, &.{ "cat-file", "-t", s1.slice() }, null);
-        defer gpa.free(kept);
-        try std.testing.expectEqualStrings("commit", std.mem.trim(u8, kept, " \t\r\n"));
-    }
+    // keepRef makes a snapshot survive an aggressive gc.
+    try keepRef(gpa, io, repo.path, "0" ** 32, "0badcafe", s1);
+    try repo.gcPruneNow();
+    try repo.expectCommitAlive(s1);
 
     // HEAD never moved and history stays a single commit (no snapshot pollution).
-    const head_after = try runOut(gpa, io, repo, &.{ "rev-parse", "HEAD" }, null);
-    defer gpa.free(head_after);
-    try std.testing.expectEqualStrings(
-        std.mem.trim(u8, head_before, " \t\r\n"),
-        std.mem.trim(u8, head_after, " \t\r\n"),
-    );
-    const count = try runOut(gpa, io, repo, &.{ "rev-list", "--count", "HEAD" }, null);
-    defer gpa.free(count);
-    try std.testing.expectEqualStrings("1", std.mem.trim(u8, count, " \t\r\n"));
+    try std.testing.expectEqual(@as(usize, 1), try repo.headCommitCount());
+}
+
+test "snapshot chain: one tip ref keeps every ancestor alive through gc" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+
+    var repo = try git_test.TempRepo.init(gpa, io, "nova-chaintest");
+    defer repo.deinit();
+
+    const index = try repo.indexPath();
+    defer gpa.free(index);
+
+    const session = "1" ** 32;
+
+    // Three snapshots, each chained onto the previous one. After each, the ref
+    // moves to the new tip and the superseded one is released.
+    try repo.writeFile("a.txt", "one\n");
+    const s1 = try snapshot(gpa, io, repo.path, index, null);
+    try keepRef(gpa, io, repo.path, session, "entry001", s1);
+
+    try repo.writeFile("a.txt", "two\n");
+    const s2 = try snapshot(gpa, io, repo.path, index, s1);
+    try keepRef(gpa, io, repo.path, session, "entry002", s2);
+    try dropRef(gpa, io, repo.path, session, "entry001");
+
+    try repo.writeFile("a.txt", "three\n");
+    const s3 = try snapshot(gpa, io, repo.path, index, s2);
+    try keepRef(gpa, io, repo.path, session, "entry003", s3);
+    try dropRef(gpa, io, repo.path, session, "entry002");
+
+    // Exactly one ref remains for the session, at the tip.
+    {
+        const refs = try repo.sessionRefs(session);
+        defer repo.freeRefs(refs);
+        try std.testing.expectEqual(@as(usize, 1), refs.len);
+        try std.testing.expectEqualStrings("refs/nova/" ++ session ++ "/entry003", refs[0]);
+        try repo.expectResolvesTo(refs[0], s3.slice());
+    }
+
+    // An aggressive gc must not collect the ancestors: they are reachable from
+    // the tip through the parent chain even though their own refs are gone.
+    try repo.gcPruneNow();
+    for ([_]ObjectId{ s1, s2, s3 }) |commit| try repo.expectCommitAlive(commit);
+
+    // Chained commits still restore by tree, so an ancestor is a valid target.
+    try restore(gpa, io, repo.path, index, s1);
+    {
+        const content = try showFile(gpa, io, repo.path, s1.slice(), "a.txt");
+        defer gpa.free(content);
+        try std.testing.expectEqualStrings("one\n", content);
+    }
+
+    // HEAD never moved: the chain is entirely off-branch.
+    try std.testing.expectEqual(@as(usize, 1), try repo.headCommitCount());
+
+    // dropSessionRefs releases the whole chain in one call.
+    try dropSessionRefs(gpa, io, repo.path, session);
+    try std.testing.expectEqual(@as(usize, 0), try repo.sessionRefCount(session));
 }
 
 test "worktree lanes: list finds lane branches, merge folds one in, conflict rolls back" {
@@ -582,41 +722,25 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     const io = std.testing.io;
     if (!isAvailable(gpa, io)) return error.SkipZigTest;
 
-    var rand: [8]u8 = undefined;
-    io.random(&rand);
-    const hex = std.fmt.bytesToHex(rand, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-mergetest-{s}", .{hex[0..]});
-    defer gpa.free(name);
+    var repo = try git_test.TempRepo.init(gpa, io, "nova-mergetest");
+    defer repo.deinit();
 
-    try std.Io.Dir.cwd().createDirPath(io, name);
-    defer std.Io.Dir.cwd().deleteTree(io, name) catch {};
-
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    const repo = try std.fs.path.join(gpa, &.{ cwd, name });
-    defer gpa.free(repo);
-
-    // Baseline commit with a git identity so worktree commits inherit it.
-    try expectOk(gpa, io, repo, &.{ "init", "-q" });
-    try expectOk(gpa, io, repo, &.{ "config", "core.autocrlf", "false" });
-    try expectOk(gpa, io, repo, &.{ "config", "user.name", "t" });
-    try expectOk(gpa, io, repo, &.{ "config", "user.email", "t@t" });
-    try writeFileRel(io, name, "base.txt", "base\n");
-    try expectOk(gpa, io, repo, &.{ "add", "-A" });
-    try expectOk(gpa, io, repo, &.{ "commit", "-qm", "baseline" });
+    try repo.writeFile("base.txt", "base\n");
+    try repo.expectOk(&.{ "add", "-A" });
+    try repo.expectOk(&.{ "commit", "-qm", "with base" });
 
     // Two lanes forked from HEAD (nested under the repo; git tracks them as
     // linked worktrees, not files).
-    const dest = try std.fs.path.join(gpa, &.{ repo, "wt-dest" });
+    const dest = try std.fs.path.join(gpa, &.{ repo.path, "wt-dest" });
     defer gpa.free(dest);
-    const src = try std.fs.path.join(gpa, &.{ repo, "wt-src" });
+    const src = try std.fs.path.join(gpa, &.{ repo.path, "wt-src" });
     defer gpa.free(src);
-    try worktreeAdd(gpa, io, repo, dest, "nova/dest");
-    try worktreeAdd(gpa, io, repo, src, "nova/src");
+    try worktreeAdd(gpa, io, repo.path, dest, "nova/dest");
+    try worktreeAdd(gpa, io, repo.path, src, "nova/src");
 
     // worktreeList reports both lane branches.
     {
-        const list = try worktreeList(gpa, io, repo);
+        const list = try worktreeList(gpa, io, repo.path);
         defer freeWorktreeList(gpa, list);
         var saw_src = false;
         var saw_dest = false;
@@ -628,9 +752,9 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     }
 
     // Non-conflicting work on the source lane; commit it onto nova/src.
-    try writeFileRel(io, name, "wt-src/feature.txt", "feature\n");
-    try expectOk(gpa, io, src, &.{ "add", "-A" });
-    try expectOk(gpa, io, src, &.{ "commit", "-qm", "feat" });
+    try repo.writeFile("wt-src/feature.txt", "feature\n");
+    try repo.expectOkIn(src, &.{ "add", "-A" });
+    try repo.expectOkIn(src, &.{ "commit", "-qm", "feat" });
 
     // Merge folds the source lane's file into the destination worktree.
     try std.testing.expectEqual(MergeOutcome.ok, try merge(gpa, io, dest, "nova/src"));
@@ -641,42 +765,14 @@ test "worktree lanes: list finds lane branches, merge folds one in, conflict rol
     }
 
     // Divergent edits to the same file on each lane → conflict, rolled back.
-    try writeFileRel(io, name, "wt-src/base.txt", "src-change\n");
-    try expectOk(gpa, io, src, &.{ "commit", "-aqm", "src edit" });
-    try writeFileRel(io, name, "wt-dest/base.txt", "dest-change\n");
-    try expectOk(gpa, io, dest, &.{ "commit", "-aqm", "dest edit" });
+    try repo.writeFile("wt-src/base.txt", "src-change\n");
+    try repo.expectOkIn(src, &.{ "commit", "-aqm", "src edit" });
+    try repo.writeFile("wt-dest/base.txt", "dest-change\n");
+    try repo.expectOkIn(dest, &.{ "commit", "-aqm", "dest edit" });
     try std.testing.expectEqual(MergeOutcome.conflict, try merge(gpa, io, dest, "nova/src"));
 
     // The abort left the destination exactly as it was — no half-merge.
     const restored = try showFile(gpa, io, dest, "HEAD", "base.txt");
     defer gpa.free(restored);
     try std.testing.expectEqualStrings("dest-change\n", restored);
-}
-
-fn expectOk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, args: []const []const u8) !void {
-    var out = try run(gpa, io, dir, args, null);
-    defer out.deinit(gpa);
-    try std.testing.expectEqual(@as(u8, 0), out.code);
-}
-
-fn treeOf(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, rev: ObjectId) !ObjectId {
-    const spec = try std.fmt.allocPrint(gpa, "{s}^{{tree}}", .{rev.slice()});
-    defer gpa.free(spec);
-    const raw = try runOut(gpa, io, dir, &.{ "rev-parse", spec }, null);
-    defer gpa.free(raw);
-    return ObjectId.parse(raw);
-}
-
-fn writeFileRel(io: std.Io, repo_name: []const u8, rel: []const u8, content: []const u8) !void {
-    const gpa = std.testing.allocator;
-    const full = try std.fs.path.join(gpa, &.{ repo_name, rel });
-    defer gpa.free(full);
-    if (std.fs.path.dirname(rel)) |sub| {
-        const dir = try std.fs.path.join(gpa, &.{ repo_name, sub });
-        defer gpa.free(dir);
-        try std.Io.Dir.cwd().createDirPath(io, dir);
-    }
-    var f = try std.Io.Dir.createFile(.cwd(), io, full, .{});
-    defer f.close(io);
-    try f.writeStreamingAll(io, content);
 }

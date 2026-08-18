@@ -22,6 +22,12 @@ Steering is done by enqueuing messages into a bounded queue. By default, the fro
 
 User's can branch off at any point in their conversation to pursue different paths and try different approaches. These are saved into the session and are resumable. When a branch occurs, we actually revert the entire project state to that point in time, not just the conversation. This is achieved via git shadow snapshots. User messages, assistant messages and even tool calls are all valid branching points. Once you're happy with a certain branch, you can `/save` it to commit to the working tree.
 
+When a snapshot is taken, the working tree is staged into a dedicated index, written as a tree, and committed. HEAD stays attached to the user's branch and no commit is made to the user's working tree.
+
+Snapshots are taken after every tool batch and at turn boundaries, written only if the batch modified files. The check compares the content-addressed tree id against the last snapshot.
+
+Each snapshot's parent is the previous snapshot on the same timeline, so a timeline's snapshots form a chain whose tip reaches all of them. Keeping the chain alive against `git gc` therefore costs **one ref per timeline tip** (`refs/nova/<session>/<entry>`), not one per snapshot: when the tip advances, the ref moves with it and the superseded ref is dropped. Branching the conversation forks the chain too, because a new snapshot's parent is resolved from the conversation's current position, not from whatever was written last.
+
 ## Parallel
 
 Subagent workflows are achieved by the `/parallel` command which creates a separate git worktree for your agent to work in. The TUI supports tiling so you can have multiple agents on the screen at any time. We call each tile a `lane`. The maximum number of lanes that can be active is currently 4, because that is the empirical limit for the mental load required to manage all agents effectively.

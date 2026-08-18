@@ -13,6 +13,10 @@ const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
 const vcs = @import("vcs.zig");
 
+/// Test-only. Referenced solely from `test` blocks, so a normal build never
+/// analyzes it.
+const git_test = @import("testing/git.zig");
+
 const assert = std.debug.assert;
 const message_queue_capacity: u32 = 64;
 
@@ -135,11 +139,23 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.atomic.Mutex = .unlocked,
-    /// git-shadow snapshot state (see `snapshotAfterBatch`). The dedicated index
-    /// path is resolved once and cached; `last_snapshot_tree` dedups unchanged
-    /// batches; `snapshots_disabled` latches off when git/the repo is absent.
+    /// git-shadow snapshot state (see `snapshotNow`). The dedicated index path is
+    /// resolved once and cached; `snapshots_disabled` latches off when git/the
+    /// repo is absent.
     snapshot_index: ?[]u8 = null,
+    /// Tree of the last snapshot written, to dedup a batch that changed nothing.
     last_snapshot_tree: ?vcs.ObjectId = null,
+    /// The last snapshot commit written, which the next one chains onto as its
+    /// parent. Null means "resolve the parent from the session tree" — the state
+    /// after a resume, a timeline jump, or a merge, where the chain must continue
+    /// from whatever snapshot the current conversation position resolves to
+    /// rather than from wherever this process last wrote.
+    last_snapshot_commit: ?vcs.ObjectId = null,
+    /// The entry naming the ref that currently pins `last_snapshot_commit`. Once
+    /// the next snapshot chains onto that commit, this ref is redundant (the new
+    /// tip reaches it) and gets dropped, which is what keeps the ref count at one
+    /// per timeline tip instead of one per snapshot.
+    last_snapshot_ref: ?session_mod.EntryId = null,
     snapshots_disabled: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
@@ -495,14 +511,19 @@ pub const Agent = struct {
     /// Snapshot the working tree (git-shadow) and bind the commit to the active
     /// conversation leaf, so navigating back here restores this code state.
     ///
-    /// The single snapshot entry point. Called after every tool batch (giving
-    /// per-tool-batch timeline granularity) and at turn boundaries by the
-    /// workspace; both share this one implementation and the one piece of dedup
-    /// state, so a checkpoint means the same thing wherever it is taken.
+    /// The single snapshot entry point: the tool loop calls it after every batch,
+    /// the workspace at turn boundaries. Both share the dedup and chain state, so
+    /// a checkpoint means the same thing wherever it is taken.
     ///
-    /// Authoritative change-detection without trusting tool output: the
-    /// content-addressed tree id is compared to the last snapshot's; an unchanged
-    /// tree (a read-only batch, or a build that only touched gitignored files) is
+    /// Change detection never trusts tool output — the content-addressed tree id
+    /// is compared to the last snapshot's, and an unchanged tree (a read-only
+    /// batch, or a build that only touched gitignored files) writes nothing.
+    ///
+    /// Snapshots chain: each commit's parent is the previous snapshot on this
+    /// timeline, so the tip reaches every snapshot behind it and one ref at the
+    /// tip keeps the whole chain alive. That makes the previous tip's ref
+    /// redundant, and dropping it holds the ref count at one per timeline tip
+    /// rather than one per snapshot. The chain is still entirely off-branch.
     pub fn snapshotNow(self: *Agent) SnapshotOutcome {
         if (self.snapshots_disabled) return .unavailable;
         const session_writer = self.context_manager.session_writer orelse return .no_leaf;
@@ -518,16 +539,48 @@ pub const Agent = struct {
             self.snapshot_index = path;
             break :blk path;
         };
+
+        const parent = self.resolveSnapshotParent(session_writer);
+
         const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return .failed;
         if (self.last_snapshot_tree) |last| {
             if (tree.eql(last)) return .unchanged; // nothing tracked changed — no node
         }
-        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree) catch return .failed;
+        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree, parent.commit) catch return .failed;
         session_writer.setLeafSnapshot(commit.slice()) catch return .failed;
         self.last_snapshot_tree = tree;
-        const leaf_id = session_writer.leaf() orelse return .no_leaf;
-        vcs.keepRef(self.gpa, self.io, self.cwd, leaf_id, commit) catch {};
+        self.last_snapshot_commit = commit;
+
+        const leaf_raw = session_writer.leaf() orelse return .no_leaf;
+        const leaf = session_mod.EntryId.fromSlice(leaf_raw) catch return .failed;
+        const session_id = session_writer.session.id.slice();
+        vcs.keepRef(self.gpa, self.io, self.cwd, session_id, leaf.slice(), commit) catch {
+            self.last_snapshot_ref = parent.ref;
+            return .failed;
+        };
+
+        if (parent.ref) |old| {
+            if (!std.mem.eql(u8, old.slice(), leaf.slice())) {
+                vcs.dropRef(self.gpa, self.io, self.cwd, session_id, old.slice()) catch {};
+            }
+        }
+        self.last_snapshot_ref = leaf;
         return .sealed;
+    }
+
+    const SnapshotParent = struct {
+        commit: ?vcs.ObjectId = null,
+        ref: ?session_mod.EntryId = null,
+    };
+
+    fn resolveSnapshotParent(self: *Agent, session_writer: *session_mod.SessionWriter) SnapshotParent {
+        if (self.last_snapshot_commit) |commit| {
+            return .{ .commit = commit, .ref = self.last_snapshot_ref };
+        }
+        var binding = (session_writer.snapshotAt(self.gpa) catch null) orelse return .{};
+        defer binding.deinit(self.gpa);
+        const commit = vcs.ObjectId.parse(binding.sha) catch return .{};
+        return .{ .commit = commit, .ref = binding.entry_id };
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
@@ -1200,4 +1253,70 @@ test "clear queue drops messages without delivering them" {
 
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
+}
+
+// End-to-end ref accounting for the snapshot chain, driven through the real
+// `Agent.snapshotNow` against a real git repo and a real session writer. This is
+// the property the design rests on: ref count tracks timeline *tips*, not
+// snapshots, and superseded snapshots stay reachable as ancestors anyway.
+test "snapshotNow chains commits and keeps one ref per timeline tip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
+
+    var repo = try git_test.TempRepo.init(gpa, io, "nova-agentchain");
+    defer repo.deinit();
+
+    // The session DB lands in `<repo>/.nova`, so ignore it: otherwise every write
+    // to it would change the snapshot tree and the no-op case below could never
+    // be observed. Production keeps the DB outside the repo for the same reason.
+    try repo.writeFile(".gitignore", ".nova/\n");
+
+    var writer: session_mod.SessionWriter = undefined;
+    try writer.initDefault(gpa, io, repo.path, repo.path);
+    defer writer.deinit();
+
+    var agent = Agent.init(gpa, io, repo.path, .none);
+    defer agent.deinit();
+    agent.attachSessionWriter(&writer);
+
+    const session_id = writer.session.id.slice();
+
+    // Three file-changing steps, each with its own conversation entry, so each
+    // snapshot binds to a distinct leaf.
+    var tips: [3]vcs.ObjectId = undefined;
+    for (0..3) |step| {
+        const body = try std.fmt.allocPrint(gpa, "step {d}", .{step});
+        defer gpa.free(body);
+        try agent.addUser(body);
+        try repo.writeFile("tracked.txt", body);
+        try std.testing.expectEqual(Agent.SnapshotOutcome.sealed, agent.snapshotNow());
+        tips[step] = agent.last_snapshot_commit.?;
+    }
+
+    // A linear chain of exactly three commits reachable from the tip — not three
+    // parentless orphans, which would each count 1.
+    try std.testing.expectEqual(@as(usize, 3), try repo.revListCount(tips[2].slice()));
+    try std.testing.expectEqual(@as(usize, 1), try repo.revListCount(tips[0].slice()));
+
+    // Three snapshots, one ref: the superseded refs were dropped as the tip moved
+    // past them, and the survivor points at the newest snapshot.
+    {
+        const refs = try repo.sessionRefs(session_id);
+        defer repo.freeRefs(refs);
+        try std.testing.expectEqual(@as(usize, 1), refs.len);
+        try repo.expectResolvesTo(refs[0], tips[2].slice());
+    }
+
+    // A batch that changes nothing writes no commit and no ref.
+    try std.testing.expectEqual(Agent.SnapshotOutcome.unchanged, agent.snapshotNow());
+    try std.testing.expectEqual(@as(usize, 1), try repo.sessionRefCount(session_id));
+
+    // gc must keep all three: the two older ones are reachable only as ancestors
+    // of the tip now that their own refs are gone.
+    try repo.gcPruneNow();
+    for (tips) |commit| try repo.expectCommitAlive(commit);
+
+    // HEAD never moved: the chain is entirely off-branch.
+    try std.testing.expectEqual(@as(usize, 1), try repo.headCommitCount());
 }

@@ -162,13 +162,23 @@ pub const Workspace = struct {
         return agent.snapshotNow();
     }
 
-    fn restoreCheckpoint(self: *Workspace, rt: *runtime_mod.AgentRuntime) !void {
-        const sha_raw = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
-        defer self.gpa.free(sha_raw);
-        const sha = vcs.ObjectId.parse(sha_raw) catch return;
+    /// Restore the working tree to the snapshot bound to the now-active timeline
+    /// node — its own, or the nearest ancestor that has one. HEAD stays attached;
+    /// `vcs.restore` rewrites tracked files to that tree (adds/modifies/deletes).
+    /// Best-effort: a node with no bound snapshot (an early point, before any file
+    /// change) or a git failure leaves the working tree as-is.
+    fn restoreCheckpoint(self: *Workspace, lane: *Thread, rt: *runtime_mod.AgentRuntime) !void {
+        var binding = (try rt.session_writer.snapshotAt(self.gpa)) orelse return;
+        defer binding.deinit(self.gpa);
+        const sha = vcs.ObjectId.parse(binding.sha) catch return;
         const index = vcs.indexPath(self.gpa, self.io, rt.cwd) catch return;
         defer self.gpa.free(index);
         vcs.restore(self.gpa, self.io, rt.cwd, index, sha) catch return;
+
+        const agent = lane.agent orelse return;
+        agent.last_snapshot_commit = sha;
+        agent.last_snapshot_ref = binding.entry_id;
+        agent.last_snapshot_tree = vcs.treeOf(self.gpa, self.io, rt.cwd, sha) catch null;
     }
 
     pub fn navigateToEntry(self: *Workspace, entry_id: []const u8) !void {
@@ -176,8 +186,15 @@ pub const Workspace = struct {
         const rt = self.liveRuntime() orelse return Error.NoActiveRuntime;
         try rt.session_writer.navigate(entry_id);
         try rt.reloadMessages();
-        if (self.active.agent) |agent| agent.last_snapshot_tree = null;
-        try self.restoreCheckpoint(rt);
+        resetSnapshotChain(self.active);
+        try self.restoreCheckpoint(self.active, rt);
+    }
+
+    fn resetSnapshotChain(lane: *Thread) void {
+        const agent = lane.agent orelse return;
+        agent.last_snapshot_tree = null;
+        agent.last_snapshot_commit = null;
+        agent.last_snapshot_ref = null;
     }
 
     pub fn createRuntime(
@@ -363,9 +380,7 @@ pub const Workspace = struct {
             vcs.worktreeRemove(self.gpa, self.io, repo, source.path) catch {};
             vcs.deleteBranch(self.gpa, self.io, repo, source.branch) catch {};
         }
-        // The destination's tree just changed underneath the agent; force the
-        // next checkpoint to write a node rather than dedup against a stale tree.
-        if (dest.agent) |agent| agent.last_snapshot_tree = null;
+        resetSnapshotChain(dest);
     }
 
     pub fn collectParkedLanes(self: *Workspace, repo: []const u8) ![]vcs.WorktreeEntry {
