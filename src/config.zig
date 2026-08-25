@@ -534,6 +534,12 @@ fn parseObject(
     return out;
 }
 
+/// The `Provider` a config file (or an RPC `set_model`) names, or null when the
+/// name is not one Nova knows.
+pub fn providerFromName(name: []const u8) ?Provider {
+    return providers_by_name.get(name);
+}
+
 fn parseProviders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderConfig {
     var providers: std.ArrayList(ProviderConfig) = .empty;
     errdefer {

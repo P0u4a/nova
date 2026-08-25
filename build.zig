@@ -3,10 +3,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const vaxis_dep = b.dependency("vaxis", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const websocket_vendor_mod = b.createModule(.{
         .root_source_file = b.path("vendor/websocket.zig/src/websocket.zig"),
         .target = target,
@@ -43,14 +39,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/dynlib.zig"),
         .target = target,
         .optimize = optimize,
-    });
-    const terminal_markdown_mod = b.createModule(.{
-        .root_source_file = b.path("lib/terminal_markdown.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
-        },
     });
     const counting_allocator_mod = b.createModule(.{
         .root_source_file = b.path("lib/counting_allocator.zig"),
@@ -94,11 +82,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bounded_queue", .module = bounded_queue_mod },
-            .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "websocket", .module = websocket_mod },
             .{ .name = "logger", .module = logger_mod },
             .{ .name = "dynlib", .module = dynlib_mod },
-            .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "c", .module = c_mod },
             .{ .name = "model_catalog", .module = model_catalog_mod },
@@ -127,8 +113,10 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_OMIT_LOAD_EXTENSION",
             "-DSQLITE_DQS=0",
             "-DSQLITE_USE_URI=1",
-            "-DSQLITE_ENABLE_JSON1",
-            "-DSQLITE_ENABLE_FTS5",
+            // JSON1 and FTS5 are deliberately absent: the session store keeps
+            // payloads as opaque text and never queries into them, so enabling
+            // either only added compile time and binary size. Re-add the flag if a
+            // query ever needs `json_*` or a full-text index.
             "-Wno-implicit-function-declaration",
             "-Wno-unused-but-set-variable",
         },
@@ -158,11 +146,9 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "nova", .module = mod },
-                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
                 .{ .name = "websocket", .module = websocket_mod },
                 .{ .name = "logger", .module = logger_mod },
                 .{ .name = "dynlib", .module = dynlib_mod },
-                .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
             },
         }),
     });
@@ -234,36 +220,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     for ([_]*std.Build.Module{
-        terminal_markdown_mod,
         bounded_queue_mod,
         logger_mod,
         websocket_mod,
     }) |lib_mod| {
         const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
-    }
-
-    // Benchmarks are standalone executables under bench/, always built
-    // ReleaseFast so the numbers are meaningful, and wired only to
-    // `zig build bench` — never to the default install or `zig build test`.
-    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
-    for ([_][]const u8{
-        "bench/markdown_render.zig",
-        "bench/markdown_incremental.zig",
-    }) |bench_src| {
-        const bench_exe = b.addExecutable(.{
-            .name = b.fmt("bench-{s}", .{std.fs.path.stem(bench_src)}),
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(bench_src),
-                .target = target,
-                .optimize = .ReleaseFast,
-                .imports = &.{
-                    .{ .name = "terminal_markdown", .module = terminal_markdown_mod },
-                    .{ .name = "counting_allocator", .module = counting_allocator_mod },
-                },
-            }),
-        });
-        bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
     }
 
     // Just like flags, top level steps are also listed in the `--help` menu.

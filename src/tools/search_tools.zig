@@ -47,7 +47,6 @@ pub const find_tool: common.Tool = .{
         },
     },
     .run = runFind,
-    .display = displayFind,
 };
 
 pub const grep_tool: common.Tool = .{
@@ -94,7 +93,6 @@ pub const grep_tool: common.Tool = .{
         },
     },
     .run = runGrep,
-    .display = displayGrep,
 };
 
 const FindArgs = struct {
@@ -241,48 +239,6 @@ fn searchError(gpa: std.mem.Allocator, name: []const u8, err: anyerror) common.E
     };
 }
 
-fn displayFind(gpa: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
-    const query = try common.extractStringField(gpa, arguments, "query", "");
-    defer gpa.free(query);
-    if (query.len == 0) return .{ .label = try gpa.dupe(u8, "Find files") };
-    return .{ .label = try std.fmt.allocPrint(gpa, "Find {s}", .{query}) };
-}
-
-fn displayGrep(gpa: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
-    const summary = try grepSummary(gpa, arguments);
-    defer gpa.free(summary);
-    const glob = try common.extractStringField(gpa, arguments, "glob", "");
-    defer gpa.free(glob);
-    if (glob.len > 0) {
-        return .{ .label = try std.fmt.allocPrint(gpa, "Grep {s} in {s}", .{ summary, glob }) };
-    }
-    return .{ .label = try std.fmt.allocPrint(gpa, "Grep {s}", .{summary}) };
-}
-
-/// Label text for a grep call: the pattern itself when there is one, otherwise a
-/// count, so a 20-pattern sweep doesn't produce an unreadable row.
-fn grepSummary(gpa: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error![]u8 {
-    const parsed = std.json.parseFromSlice(GrepArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch {
-        return gpa.dupe(u8, "patterns");
-    };
-    defer parsed.deinit();
-    const count = patternCount(parsed.value);
-    if (count == 0) return gpa.dupe(u8, "patterns");
-    if (count == 1) {
-        const single = parsed.value.pattern orelse blk: {
-            const list = parsed.value.patterns orelse break :blk "";
-            for (list) |pattern| {
-                if (pattern.len > 0) break :blk pattern;
-            }
-            break :blk "";
-        };
-        return std.fmt.allocPrint(gpa, "{s}", .{single});
-    }
-    return std.fmt.allocPrint(gpa, "{d} patterns", .{count});
-}
-
-// === tests ==================================================================
-
 test "grep rejects regex with more than one pattern" {
     const gpa = std.testing.allocator;
     var output = try runGrep(gpa, std.testing.io, ".",
@@ -342,31 +298,4 @@ test "limit is clamped to a sane range" {
     try std.testing.expectEqual(limit_default, clampLimit(0));
     try std.testing.expectEqual(@as(u32, 10), clampLimit(10));
     try std.testing.expectEqual(limit_max, clampLimit(100_000));
-}
-
-test "grep label shows one pattern verbatim and collapses many" {
-    const gpa = std.testing.allocator;
-    {
-        var shown = try displayGrep(gpa,
-            \\{"patterns":["keepRef"]}
-        );
-        defer shown.deinit(gpa);
-        try std.testing.expectEqualStrings("Grep keepRef", shown.label);
-    }
-    {
-        var shown = try displayGrep(gpa,
-            \\{"patterns":["a","b","c"],"glob":"*.zig"}
-        );
-        defer shown.deinit(gpa);
-        try std.testing.expectEqualStrings("Grep 3 patterns in *.zig", shown.label);
-    }
-}
-
-test "find label shows the query" {
-    const gpa = std.testing.allocator;
-    var shown = try displayFind(gpa,
-        \\{"query":"session writer"}
-    );
-    defer shown.deinit(gpa);
-    try std.testing.expectEqualStrings("Find session writer", shown.label);
 }

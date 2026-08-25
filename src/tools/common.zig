@@ -1,22 +1,38 @@
 const std = @import("std");
 
+const ai = @import("../ai.zig");
+
 const assert = std.debug.assert;
 
-pub const DisplayKind = enum(u8) { text, diff };
-
+/// What a tool produced. One text channel: there is no UI to render for, so a
+/// tool's output is exactly what the model observes, and the RPC layer forwards
+/// it verbatim as the tool result's content.
 pub const Output = struct {
     stdout: []u8,
     stderr: []u8,
     code: u8,
-    display: ?[]u8 = null,
-    display_kind: DisplayKind = .text,
+    /// Set when a tool wants the observation framed differently from raw stdout
+    /// (truncation notices, spill paths). `render` produces the final text.
     observation: ?Observation = null,
+    /// Structured extras for the tool result's `details` field, as a complete JSON
+    /// object (owned). This is data, not presentation: `edit` and `write` put the
+    /// diff they produced here so a client can render the change without
+    /// re-reading the file, matching the RPC contract's `details`. Null means the
+    /// field is omitted.
+    details_json: ?[]u8 = null,
+    /// An image the tool wants the model to actually see, alongside the text.
+    /// Rare — only a tool whose whole job is to surface pixels sets this. It
+    /// becomes a second content block on the tool result; the text still has to
+    /// stand on its own, because the wire format drops the image for a model that
+    /// cannot take one.
+    image: ?ai.ImageBlock = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
-        if (self.display) |display| gpa.free(display);
         if (self.observation) |*observation| observation.deinit(gpa);
+        if (self.details_json) |details| gpa.free(details);
+        if (self.image) |*attached| attached.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -61,23 +77,12 @@ pub const Error = error{
     OutOfMemory,
 } || std.Io.Cancelable || std.Io.UnexpectedError;
 
-pub const ToolDisplay = struct {
-    /// Human-facing summary shown while the tool is collapsed.
-    label: []u8,
-    /// Machine-facing detail shown in place of `label` when expanded.
-    expanded_label: ?[]u8 = null,
-
-    pub fn deinit(self: *ToolDisplay, gpa: std.mem.Allocator) void {
-        gpa.free(self.label);
-        if (self.expanded_label) |label| gpa.free(label);
-        self.* = undefined;
-    }
-};
-
-/// A typed record describing one tool. The Tool registry in `tools.zig`
-/// is a slice of these; it is the single source of truth for what tools
-/// exist. Display policy (Expand-by-default, render mode) is NOT carried
-/// here — that lives TUI-side.
+/// A typed record describing one tool. The registry in `tools.zig` is a slice of
+/// these and is the single source of truth for what tools exist.
+///
+/// There is no display hook: the agent is driven over RPC, so a tool's only
+/// output is the observation the model reads, which the RPC layer forwards to the
+/// client as the tool result's content. Clients render it however they like.
 pub const Tool = struct {
     name: []const u8,
     /// Raw description template. May contain `{{hsep}}` placeholders that
@@ -90,13 +95,6 @@ pub const Tool = struct {
         cwd: []const u8,
         args: []const u8,
     ) Error!Output,
-    /// Produce the human display metadata shown in the TUI's tool row.
-    /// `label` is the collapsed summary; `expanded_label`, when present,
-    /// replaces it while the row is expanded.
-    display: *const fn (
-        gpa: std.mem.Allocator,
-        args: []const u8,
-    ) std.mem.Allocator.Error!ToolDisplay,
 };
 
 pub const Schema = struct {
@@ -191,14 +189,7 @@ pub const Schema = struct {
 
 pub fn ok(gpa: std.mem.Allocator, stdout: []u8) Error!Output {
     const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = null };
-}
-
-pub fn okWithDisplay(gpa: std.mem.Allocator, stdout: []u8, display: []u8) Error!Output {
-    assert(stdout.len > 0);
-    assert(display.len > 0);
-    const stderr = try gpa.alloc(u8, 0);
-    return .{ .stdout = stdout, .stderr = stderr, .code = 0, .display = display };
+    return .{ .stdout = stdout, .stderr = stderr, .code = 0 };
 }
 
 pub fn fail(gpa: std.mem.Allocator, message: []const u8, code: u8) Error!Output {
@@ -207,7 +198,7 @@ pub fn fail(gpa: std.mem.Allocator, message: []const u8, code: u8) Error!Output 
     const stdout = try gpa.alloc(u8, 0);
     errdefer gpa.free(stdout);
     const stderr = try gpa.dupe(u8, message);
-    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+    return .{ .stdout = stdout, .stderr = stderr, .code = code };
 }
 
 pub fn failFmt(
@@ -220,12 +211,10 @@ pub fn failFmt(
     const stdout = try gpa.alloc(u8, 0);
     errdefer gpa.free(stdout);
     const stderr = try std.fmt.allocPrint(gpa, fmt, args);
-    return .{ .stdout = stdout, .stderr = stderr, .code = code, .display = null };
+    return .{ .stdout = stdout, .stderr = stderr, .code = code };
 }
 
-/// Helper for display implementations. Parses the argument JSON and extracts
-/// a single string field; returns the bare `fallback` (owned) when the JSON is
-/// partial / invalid / missing the field.
+/// Read a whole file, refusing anything past `bytes_max` rather than buffering it.
 pub fn readFileBytes(gpa: std.mem.Allocator, io: std.Io, absolute: []const u8, bytes_max: usize) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io, absolute, .{});
     defer file.close(io);
@@ -246,21 +235,4 @@ pub fn mapAllocError(err: anyerror) Error {
         error.OutOfMemory => Error.OutOfMemory,
         else => Error.Unexpected,
     };
-}
-
-pub fn extractStringField(
-    gpa: std.mem.Allocator,
-    args: []const u8,
-    field: []const u8,
-    fallback: []const u8,
-) std.mem.Allocator.Error![]u8 {
-    if (args.len == 0) return gpa.dupe(u8, fallback);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, args, .{}) catch {
-        return gpa.dupe(u8, fallback);
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return gpa.dupe(u8, fallback);
-    const value = parsed.value.object.get(field) orelse return gpa.dupe(u8, fallback);
-    if (value != .string) return gpa.dupe(u8, fallback);
-    return gpa.dupe(u8, value.string);
 }

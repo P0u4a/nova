@@ -178,6 +178,78 @@ pub const AgentRuntime = struct {
         try target.applyFromConfig(config);
     }
 
+    /// Point the runtime at a different session, keeping the client, skills and
+    /// system prompt — the project has not changed, only the conversation. A null
+    /// `session_id` starts a fresh one. Must not be called mid-turn.
+    pub fn switchSession(self: *AgentRuntime, session_dir: []const u8, session_id: ?[]const u8) !void {
+        assert(session_dir.len > 0);
+        if (session_id) |id| assert(id.len > 0);
+
+        // `SessionWriter` owns a background thread and is initialised through an
+        // out pointer, so it cannot be swapped in from a temporary — the old one
+        // has to go first. Check the id resolves before that point, so a bad one is
+        // refused while the runtime is still whole.
+        if (session_id) |id| try self.assertSessionExists(id);
+
+        self.session_writer.deinit();
+        if (session_id) |id| {
+            try self.session_writer.initResumeDefault(self.gpa, self.io, self.home_dir, id);
+        } else {
+            try self.session_writer.initDefault(self.gpa, self.io, self.home_dir, session_dir);
+        }
+        // No re-attach: the writer is a field of this struct, so the agent still
+        // holds the right address — only what lives behind it changed.
+        try self.reloadMessages();
+        assert(self.agent.messages().len > 0); // The system prompt always survives.
+    }
+
+    /// Fail unless `session_id` names a session in the same database, using a
+    /// throwaway read-only connection so nothing about the live one changes.
+    fn assertSessionExists(self: *AgentRuntime, session_id: []const u8) !void {
+        assert(session_id.len > 0);
+        var manager = try session_mod.SessionManager.initRead(self.gpa, self.io, self.session_writer.db_path);
+        defer manager.deinit();
+        _ = try manager.@"resume"(session_id);
+    }
+
+    /// Switch the model the agent prompts with, reconnecting the client. The
+    /// conversation is untouched — a model change mid-session is normal.
+    pub fn setModel(self: *AgentRuntime, config: *config_mod.Config, provider: config_mod.Provider, model_id: []const u8) !void {
+        assert(model_id.len > 0);
+
+        const owned = try self.gpa.dupe(u8, model_id);
+        errdefer self.gpa.free(owned);
+        // Keep the reasoning effort configured for this model, if the config
+        // names one; otherwise the adapter's default applies.
+        const effort = effortFor(config.*, provider, model_id);
+
+        var replacement: config_mod.Model = .{ .id = owned, .reasoning_effort = effort };
+        errdefer replacement.deinit(self.gpa);
+        self.disconnectClient();
+        if (config.model) |*old| old.deinit(self.gpa);
+        config.model = replacement;
+        config.provider = provider;
+        config_mod.assertModelSelection(config);
+
+        try self.applyFromConfig(config.*);
+        assert(self.client != .none);
+    }
+
+    fn effortFor(config: config_mod.Config, provider: config_mod.Provider, model_id: []const u8) ?ai.ReasoningEffort {
+        for (config.providers) |candidate| {
+            if (candidate.provider != provider) continue;
+            for (candidate.models) |model| {
+                if (std.mem.eql(u8, model.id, model_id)) return model.reasoning_effort;
+            }
+        }
+        return null;
+    }
+
+    /// The id of the session the runtime is writing to.
+    pub fn sessionId(self: *const AgentRuntime) []const u8 {
+        return self.session_writer.session.id.slice();
+    }
+
     /// Rehydrate the agent's conversation from the session's current leaf.
     /// Call after `session_writer.navigate(...)` switches branches: clears the
     /// in-memory messages (keeping the system prompt) and reloads the new

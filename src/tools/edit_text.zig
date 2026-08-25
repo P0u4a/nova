@@ -572,8 +572,6 @@ pub fn countChanges(before: []const u8, after: []const u8) Counts {
     return counts;
 }
 
-// === tests ==================================================================
-
 test "detectLineEnding follows the first break" {
     try std.testing.expectEqual(LineEnding.lf, detectLineEnding("a\nb\r\n"));
     try std.testing.expectEqual(LineEnding.crlf, detectLineEnding("a\r\nb\n"));

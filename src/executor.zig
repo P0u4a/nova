@@ -19,41 +19,31 @@ pub const BackgroundStart = struct {
     owner: *anyopaque,
 };
 
-/// The output of one ToolCall, carrying both the LLM channel (the terse
-/// observation that flows into history) and the human channel (display
-/// label/body for the TUI) in one record.
+/// The output of one ToolCall. One channel: the observation the model reads is
+/// also exactly what the RPC layer forwards to the client as the result content.
 pub const ToolResult = struct {
-    /// LLM channel — the id this result is responding to.
+    /// The id this result is responding to.
     call_id: []u8,
-    /// LLM channel — the terse observation that flows into the assistant's
-    /// next `tool` role message in history.
+    /// The observation, which flows into the assistant's next `tool` role message
+    /// in history and out over RPC as the result's text content.
     content: []u8,
-    /// Identity — the tool's name (e.g. "bash"). The TUI uses this to look
-    /// up its display policy. Not strictly a channel — it's the same name
-    /// the LM emitted.
+    /// The tool's name, as the model emitted it.
     name: []u8,
-    /// Human channel — the collapsed Display label.
-    display_label: []u8,
-    /// Human channel — label shown in place of `display_label` when expanded.
-    display_expanded_label: ?[]u8,
-    /// Human channel — the display body shown in the thread.
-    display_body: []u8,
-    /// Human channel — what `display_body` is (plain text or a diff). The TUI
-    /// maps this to a draw style, overriding the per-tool-name policy.
-    display_kind: tools.DisplayKind = .text,
-    /// Human channel — stderr text rendered in red below the body, or null.
-    stderr: ?[]u8,
-    /// Human channel — overrides body styling to red at draw time.
+    /// Structured extras for the result's `details` field, as a complete JSON
+    /// object, or null to omit it. See `tools.Output.details_json`.
+    details_json: ?[]u8,
+    /// An image the tool wants the model to see. Becomes a second content block
+    /// on the result. Null for every tool but the ones whose job is pixels.
+    image: ?ai.ImageBlock,
+    /// Whether the call failed — the result's `isError`.
     failed: bool,
 
     pub fn deinit(self: *ToolResult, gpa: std.mem.Allocator) void {
         gpa.free(self.call_id);
         gpa.free(self.content);
         gpa.free(self.name);
-        gpa.free(self.display_label);
-        if (self.display_expanded_label) |label| gpa.free(label);
-        gpa.free(self.display_body);
-        if (self.stderr) |s| gpa.free(s);
+        if (self.details_json) |details| gpa.free(details);
+        if (self.image) |*attached| attached.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -165,22 +155,56 @@ pub const ExecutorService = struct {
         errdefer self.gpa.free(content);
         const name = try self.gpa.dupe(u8, call.name);
         errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
-        errdefer display.deinit(self.gpa);
-        const display_body = try makeDisplayBody(self.gpa, output);
-        errdefer self.gpa.free(display_body);
-        const stderr = if (output.stderr.len > 0) try self.gpa.dupe(u8, output.stderr) else null;
-        const failed = output.code != 0;
+        const details: ?[]u8 = if (output.details_json) |json| try self.gpa.dupe(u8, json) else null;
+        errdefer if (details) |json| self.gpa.free(json);
+        // Moved out of `output` rather than copied: the bytes can be megabytes and
+        // `output.deinit` would otherwise free them behind us.
+        const attached = output.image;
+        output.image = null;
         return .{
             .call_id = call_id,
             .content = content,
             .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
-            .display_body = display_body,
-            .display_kind = output.display_kind,
-            .stderr = stderr,
-            .failed = failed,
+            .details_json = details,
+            .image = attached,
+            .failed = output.code != 0,
+        };
+    }
+
+    /// A tool that failed to execute at all (spawn failure, cancellation aside).
+    /// Reported as a failed result rather than an error, so one broken call does
+    /// not abort the batch.
+    fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
+        const name = try self.gpa.dupe(u8, call.name);
+        errdefer self.gpa.free(name);
+        const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, @errorName(err) });
+        return .{
+            .call_id = call_id,
+            .content = content,
+            .name = name,
+            .details_json = null,
+            .image = null,
+            .failed = true,
+        };
+    }
+
+    /// A bash call the safety classifier flagged and the client declined.
+    fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
+        const message = "The tool call was rejected as unsafe. Try something else.";
+        const call_id = try self.gpa.dupe(u8, call.call_id);
+        errdefer self.gpa.free(call_id);
+        const name = try self.gpa.dupe(u8, call.name);
+        errdefer self.gpa.free(name);
+        const content = try self.gpa.dupe(u8, message);
+        return .{
+            .call_id = call_id,
+            .content = content,
+            .name = name,
+            .details_json = null,
+            .image = null,
+            .failed = true,
         };
     }
 
@@ -194,51 +218,6 @@ pub const ExecutorService = struct {
             }
         }
         return tools.run(self.gpa, self.io, self.cwd, call.name, call.arguments);
-    }
-
-    fn runFailure(self: *ExecutorService, call: ai.ToolCall, err: anyerror) !ToolResult {
-        const call_id = try self.gpa.dupe(u8, call.call_id);
-        errdefer self.gpa.free(call_id);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
-        errdefer display.deinit(self.gpa);
-        const content = try std.fmt.allocPrint(self.gpa, "tool '{s}' failed to execute: {s}", .{ call.name, @errorName(err) });
-        errdefer self.gpa.free(content);
-        const display_body = try self.gpa.dupe(u8, content);
-        return .{
-            .call_id = call_id,
-            .content = content,
-            .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
-            .display_body = display_body,
-            .stderr = null,
-            .failed = true,
-        };
-    }
-
-    fn runRejected(self: *ExecutorService, call: ai.ToolCall) !ToolResult {
-        const message = "The tool call was rejected by the user for being unsafe. Try something else.";
-        const call_id = try self.gpa.dupe(u8, call.call_id);
-        errdefer self.gpa.free(call_id);
-        const name = try self.gpa.dupe(u8, call.name);
-        errdefer self.gpa.free(name);
-        var display = try makeDisplay(self.gpa, call.name, call.arguments);
-        errdefer display.deinit(self.gpa);
-        const content = try self.gpa.dupe(u8, message);
-        errdefer self.gpa.free(content);
-        const display_body = try self.gpa.dupe(u8, message);
-        return .{
-            .call_id = call_id,
-            .content = content,
-            .name = name,
-            .display_label = display.label,
-            .display_expanded_label = display.expanded_label,
-            .display_body = display_body,
-            .stderr = null,
-            .failed = true,
-        };
     }
 };
 
@@ -255,29 +234,7 @@ fn formatLlmObservation(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
     return gpa.dupe(u8, "empty");
 }
 
-/// Look up the tool in the registry and delegate to its display formatter.
-/// Falls back to the tool name itself when unknown — shouldn't happen
-/// outside test code, since callers source the name from a `ToolCall`
-/// that the LM emitted.
-fn makeDisplay(gpa: std.mem.Allocator, name: []const u8, args: []const u8) !tools.ToolDisplay {
-    const tool = tools.lookup(name) orelse return .{ .label = try gpa.dupe(u8, name) };
-    return tool.display(gpa, args);
-}
-
-/// The human-facing body. Each tool owns its own display: when it sets a
-/// `display`, that is the body. Otherwise the body is the raw stdout, or a
-/// sentinel when there is none. The executor passes through; it knows nothing
-/// tool-specific.
-fn makeDisplayBody(gpa: std.mem.Allocator, result: tools.Output) ![]u8 {
-    if (result.display) |display| return gpa.dupe(u8, display);
-    if (result.stdout.len == 0) {
-        if (result.stderr.len > 0) return gpa.alloc(u8, 0);
-        return gpa.dupe(u8, "no output");
-    }
-    return gpa.dupe(u8, result.stdout);
-}
-
-test "ExecutorService runs bash and returns both channels" {
+test "ExecutorService runs bash and returns its observation" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
@@ -304,8 +261,6 @@ test "ExecutorService runs bash and returns both channels" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("call_0", results[0].call_id);
     try std.testing.expectEqualStrings("hello", results[0].content);
-    try std.testing.expectEqualStrings("Print hello", results[0].display_label);
-    try std.testing.expectEqualStrings("printf hello", results[0].display_expanded_label.?);
     try std.testing.expect(!results[0].failed);
 }
 
@@ -327,7 +282,6 @@ test "executor converts a tool execution error into a failed result" {
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expectEqualStrings("call_x", result.call_id);
-    try std.testing.expectEqualStrings("search", result.display_label);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "failed to execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Unexpected") != null);
 }
@@ -349,11 +303,10 @@ test "executor rejected bash result is failed and model-facing" {
     var result = try executor.runRejected(call);
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
-    try std.testing.expectEqualStrings("The tool call was rejected by the user for being unsafe. Try something else.", result.content);
-    try std.testing.expectEqualStrings(result.content, result.display_body);
+    try std.testing.expectEqualStrings("The tool call was rejected as unsafe. Try something else.", result.content);
 }
 
-test "executor dispatches write then edit, reporting both channels" {
+test "executor dispatches write then edit, reporting content and details" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -402,14 +355,11 @@ test "executor dispatches write then edit, reporting both channels" {
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
 
-    // write: succeeded, and its human channel is a diff.
+    // write: succeeded, and carried its diff as structured details.
     try std.testing.expect(!results[0].failed);
-    try std.testing.expectEqualStrings("Write greet.txt", results[0].display_label);
-    try std.testing.expectEqual(tools.DisplayKind.diff, results[0].display_kind);
 
     // edit: applied to what write just produced.
     try std.testing.expect(!results[1].failed);
-    try std.testing.expectEqualStrings("Edit greet.txt", results[1].display_label);
     try std.testing.expect(std.mem.indexOf(u8, results[1].content, "1 replacement(s)") != null);
 
     // A failed edit is reported as failed with a corrective message, not a crash.
@@ -448,4 +398,44 @@ test "executor reports an unknown tool without failing the batch" {
     }
     try std.testing.expect(results[0].failed);
     try std.testing.expect(std.mem.indexOf(u8, results[0].content, "unknown tool") != null);
+}
+
+test "an image a tool attached reaches the result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_rel = ".zig-cache/executor-image-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_rel);
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_rel, .{});
+        defer dir.close(io);
+        var file = try dir.createFile(io, "shot.png", .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "\x89PNG\r\n\x1a\n" ++ ("\x00" ** 24));
+    }
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const cwd = try std.fs.path.join(gpa, &.{ root, dir_rel });
+    defer gpa.free(cwd);
+
+    const calls = [_]ai.ToolCall{.{
+        .call_id = try gpa.dupe(u8, "call_0"),
+        .name = try gpa.dupe(u8, "view_image"),
+        .arguments = try gpa.dupe(u8, "{\"path\":\"shot.png\"}"),
+    }};
+    defer for (calls) |c| {
+        gpa.free(c.call_id);
+        gpa.free(c.name);
+        gpa.free(c.arguments);
+    };
+
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = io, .cwd = cwd });
+    const results = try executor.runAll(&calls, ToolCallObserver.noop);
+    defer {
+        for (results) |*r| r.deinit(gpa);
+        gpa.free(results);
+    }
+    const attached = results[0].image orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("image/png", attached.mime_type);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].content, "shot.png") != null);
+    try std.testing.expect(!results[0].failed);
 }

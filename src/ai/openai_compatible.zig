@@ -294,6 +294,42 @@ fn writeTextContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void 
     try std.json.Stringify.value(aw.written(), .{}, out);
 }
 
+/// Follow a run of tool results with a user message carrying any images they
+/// attached, or write nothing when there were none.
+///
+/// The tool messages themselves already went out text-only, which is all this
+/// dialect allows there. Restating the images as user content is the only way a
+/// vision model gets to see what a tool produced. The text of each tool result
+/// still stands on its own, so a model that never receives this message is not
+/// left with a dangling reference.
+fn writeAttachedImages(out: *std.Io.Writer, tool_messages: []const ai.ChatMessage) !void {
+    var count: u32 = 0;
+    for (tool_messages) |message| {
+        for (message.content) |block| {
+            if (block != .image) continue;
+            if (count == 0) {
+                try out.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(attached_images_preamble, .{}, out);
+                try out.writeByte('}');
+            }
+            try out.writeByte(',');
+            try writeImageUrl(out, block.image);
+            count += 1;
+        }
+    }
+    if (count > 0) try out.writeAll("]}");
+}
+
+const attached_images_preamble = "Attached image(s) from tool result:";
+
+fn writeImageUrl(out: *std.Io.Writer, image: ai.ImageBlock) !void {
+    try out.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+    try out.writeAll(image.mime_type);
+    try out.writeAll(";base64,");
+    try out.writeAll(image.data_base64);
+    try out.writeAll("\"}}");
+}
+
 fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
     try out.writeByte('[');
     var count: u32 = 0;
@@ -308,14 +344,7 @@ fn writeUserContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void 
             },
             .image => |image| {
                 if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
-                try out.writeByte('"');
-                try out.writeAll("data:");
-                try out.writeAll(image.mime_type);
-                try out.writeAll(";base64,");
-                try out.writeAll(image.data_base64);
-                try out.writeByte('"');
-                try out.writeAll("}}");
+                try writeImageUrl(out, image);
                 count += 1;
             },
             .reasoning, .tool_call => {},
@@ -348,9 +377,28 @@ fn writeRequestPayload(
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, out);
     try out.writeAll(",\"messages\":[");
-    for (messages, 0..) |message, index| {
-        if (index > 0) try out.writeByte(',');
-        try writeMessage(out, message);
+    var wrote_any = false;
+    var index: usize = 0;
+    while (index < messages.len) {
+        if (wrote_any) try out.writeByte(',');
+        try writeMessage(out, messages[index]);
+        wrote_any = true;
+
+        // A `tool` message's content must be text in this dialect, so an image a
+        // tool attached cannot ride along with it. Emit the whole run of tool
+        // results, then follow it with a user message carrying their images —
+        // which is where the API does accept them. See `writeAttachedImages`.
+        if (messages[index].role != .tool) {
+            index += 1;
+            continue;
+        }
+        var end = index + 1;
+        while (end < messages.len and messages[end].role == .tool) : (end += 1) {
+            try out.writeByte(',');
+            try writeMessage(out, messages[end]);
+        }
+        try writeAttachedImages(out, messages[index..end]);
+        index = end;
     }
     // `stream_options.include_usage` makes the server emit a final usage-only
     // chunk (empty `choices`) before `[DONE]`. Without it, streaming responses
@@ -822,7 +870,6 @@ test "buildToolsJson substitutes {{hsep}} placeholders with ~" {
             .description = "uses {{hsep}} marker",
             .schema = .{ .properties = &.{} },
             .run = undefined,
-            .display = undefined,
         },
     };
     const json = try buildToolsJson(gpa, &tools);
@@ -1165,4 +1212,89 @@ test "content chunk carries null usage" {
     , &content, &reasoning, &builders);
 
     try std.testing.expect(change.usage == null);
+}
+
+/// A tool-role message whose content is text plus an attached image, as
+/// `view_image` produces. Borrowed literals: nothing here is freed.
+fn toolResultWithImage(text: []const u8, blocks: []ai.ContentBlock) ai.ChatMessage {
+    blocks[0] = .{ .text = .{ .text = @constCast(text) } };
+    blocks[1] = .{ .image = .{
+        .mime_type = @constCast("image/png"),
+        .data_base64 = @constCast("aGVsbG8="),
+    } };
+    return .{ .role = .tool, .content = blocks, .call_id = @constCast("call_1") };
+}
+
+test "an image on a tool result moves into a following user message" {
+    const gpa = std.testing.allocator;
+    var blocks: [2]ai.ContentBlock = undefined;
+    const messages = [_]ai.ChatMessage{toolResultWithImage("Attached image/png for viewing: a.png (5 bytes).", &blocks)};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, "gpt-5", "", &messages, "[]", null);
+    const body = payload.written();
+
+    // The tool message itself carries only text — this dialect rejects anything
+    // else there.
+    const tool_at = std.mem.indexOf(u8, body, "\"role\":\"tool\"") orelse return error.TestFailed;
+    const user_at = std.mem.indexOf(u8, body, "\"role\":\"user\"") orelse return error.TestFailed;
+    try std.testing.expect(tool_at < user_at);
+    const tool_slice = body[tool_at..user_at];
+    try std.testing.expect(std.mem.indexOf(u8, tool_slice, "image_url") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_slice, "aGVsbG8=") == null);
+
+    // ...and the image arrives in the user message that follows it.
+    const user_slice = body[user_at..];
+    try std.testing.expect(std.mem.indexOf(u8, user_slice, "Attached image(s) from tool result:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_slice, "data:image/png;base64,aGVsbG8=") != null);
+}
+
+test "a tool result with no image is followed by no extra message" {
+    const gpa = std.testing.allocator;
+    var blocks: [1]ai.ContentBlock = .{.{ .text = .{ .text = @constCast("done") } }};
+    const messages = [_]ai.ChatMessage{.{
+        .role = .tool,
+        .content = &blocks,
+        .call_id = @constCast("call_1"),
+    }};
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, "gpt-5", "", &messages, "[]", null);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") == null);
+    // One message, so no stray separator either.
+    try std.testing.expect(std.mem.indexOf(u8, body, ",,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[,") == null);
+}
+
+test "a run of tool results yields one user message carrying every image" {
+    const gpa = std.testing.allocator;
+    var first: [2]ai.ContentBlock = undefined;
+    var second: [2]ai.ContentBlock = undefined;
+    const messages = [_]ai.ChatMessage{
+        toolResultWithImage("one", &first),
+        toolResultWithImage("two", &second),
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, "gpt-5", "", &messages, "[]", null);
+    const body = payload.written();
+
+    // Both tool messages first, then a single user message with two images.
+    var user_count: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, body, at, "\"role\":\"user\"")) |found| {
+        user_count += 1;
+        at = found + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), user_count);
+    var image_count: usize = 0;
+    at = 0;
+    while (std.mem.indexOfPos(u8, body, at, "image_url")) |found| {
+        image_count += 1;
+        at = found + 1;
+    }
+    // Two blocks, each mentioning `image_url` twice (type and object key).
+    try std.testing.expectEqual(@as(usize, 4), image_count);
 }

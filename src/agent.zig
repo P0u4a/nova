@@ -11,11 +11,6 @@ const executor_mod = @import("executor.zig");
 const session_mod = @import("session.zig");
 const skill_mod = @import("skill.zig");
 const tools = @import("tools.zig");
-const vcs = @import("vcs.zig");
-
-/// Test-only. Referenced solely from `test` blocks, so a normal build never
-/// analyzes it.
-const git_test = @import("testing/git.zig");
 
 const assert = std.debug.assert;
 const message_queue_capacity: u32 = 64;
@@ -25,6 +20,10 @@ const QueuedUserMessage = struct {
     /// images attached) lazily at drain time so the file I/O lands on the
     /// agent worker thread rather than the UI thread.
     prompt: []u8,
+    /// Images the client attached to this message, owned. Empty for the common
+    /// case. Copied on the way in because the queue outlives the request that
+    /// carried them.
+    images: []ai.ImageBlock = &.{},
     /// When set, this message is injected after the next tool batch ("steer")
     /// rather than waiting for the turn to go idle. The UI flips it via
     /// `setQueuedSteer` when the user steers a queued message.
@@ -34,7 +33,39 @@ const QueuedUserMessage = struct {
     /// generated content (e.g. background-job completion notices) whose body
     /// must not be reinterpreted as file references.
     raw: bool = false,
+
+    fn deinit(self: *QueuedUserMessage, gpa: std.mem.Allocator) void {
+        gpa.free(self.prompt);
+        freeImages(gpa, self.images);
+        self.* = undefined;
+    }
 };
+
+/// Release an owned image list. Attachments travel as owned copies through the
+/// queue and the turn job, so several places need to let go of one.
+pub fn freeImages(gpa: std.mem.Allocator, images: []ai.ImageBlock) void {
+    for (images) |*image| image.deinit(gpa);
+    gpa.free(images);
+}
+
+/// Copy an image list so the receiver can outlive the caller's buffers.
+pub fn dupeImages(gpa: std.mem.Allocator, images: []const ai.ImageBlock) ![]ai.ImageBlock {
+    if (images.len == 0) return &.{};
+    const copy = try gpa.alloc(ai.ImageBlock, images.len);
+    var filled: usize = 0;
+    errdefer {
+        for (copy[0..filled]) |*image| image.deinit(gpa);
+        gpa.free(copy);
+    }
+    for (images, copy) |source, *target| {
+        const mime = try gpa.dupe(u8, source.mime_type);
+        errdefer gpa.free(mime);
+        const data = try gpa.dupe(u8, source.data_base64);
+        target.* = .{ .mime_type = mime, .data_base64 = data };
+        filled += 1;
+    }
+    return copy;
+}
 
 const MessageQueue = bounded_queue.BoundedQueue(QueuedUserMessage);
 
@@ -139,24 +170,6 @@ pub const Agent = struct {
     message_queue: MessageQueue = .{},
     message_queue_storage: [message_queue_capacity]QueuedUserMessage = undefined,
     message_queue_mutex: std.atomic.Mutex = .unlocked,
-    /// git-shadow snapshot state (see `snapshotNow`). The dedicated index path is
-    /// resolved once and cached; `snapshots_disabled` latches off when git/the
-    /// repo is absent.
-    snapshot_index: ?[]u8 = null,
-    /// Tree of the last snapshot written, to dedup a batch that changed nothing.
-    last_snapshot_tree: ?vcs.ObjectId = null,
-    /// The last snapshot commit written, which the next one chains onto as its
-    /// parent. Null means "resolve the parent from the session tree" — the state
-    /// after a resume, a timeline jump, or a merge, where the chain must continue
-    /// from whatever snapshot the current conversation position resolves to
-    /// rather than from wherever this process last wrote.
-    last_snapshot_commit: ?vcs.ObjectId = null,
-    /// The entry naming the ref that currently pins `last_snapshot_commit`. Once
-    /// the next snapshot chains onto that commit, this ref is redundant (the new
-    /// tip reaches it) and gets dropped, which is what keeps the ref count at one
-    /// per timeline tip instead of one per snapshot.
-    last_snapshot_ref: ?session_mod.EntryId = null,
-    snapshots_disabled: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, client: ai.LanguageModel) Agent {
         return .{
@@ -189,10 +202,10 @@ pub const Agent = struct {
         self.context_manager.deinit();
         self.lockMessageQueue();
         while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            self.gpa.free(queued.prompt);
+            var owned = queued;
+            owned.deinit(self.gpa);
         }
         self.message_queue_mutex.unlock();
-        if (self.snapshot_index) |path| self.gpa.free(path);
         if (self.bash_classifier_url) |url| self.gpa.free(url);
         self.* = undefined;
     }
@@ -201,26 +214,63 @@ pub const Agent = struct {
         try self.appendMessage(.user, content);
     }
 
-    pub fn enqueueUser(self: *Agent, content: []const u8) !void {
-        assert(content.len > 0);
-        const owned = try self.gpa.dupe(u8, content);
+    /// One message to queue. `images` is borrowed — `enqueue` copies it, because
+    /// the queue outlives whatever request carried the bytes in.
+    pub const QueuedInput = struct {
+        text: []const u8,
+        images: []const ai.ImageBlock = &.{},
+        /// Inject after the next tool batch ("steer") rather than waiting for the
+        /// turn to go idle.
+        steer: bool = false,
+        /// Deliver the text verbatim — no `@`-mention expansion or skill
+        /// prefixing. For machine-generated content (e.g. background-job
+        /// completion notices) whose body must not be reinterpreted as file
+        /// references.
+        raw: bool = false,
+    };
+
+    /// Queue a user message for the next boundary. Thread-safe: callers reach
+    /// this from the client thread while the worker may be draining the same
+    /// queue.
+    pub fn enqueue(self: *Agent, input: QueuedInput) !void {
+        assert(input.text.len > 0);
+        const owned = try self.gpa.dupe(u8, input.text);
         errdefer self.gpa.free(owned);
+        const images = try dupeImages(self.gpa, input.images);
+        errdefer freeImages(self.gpa, images);
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned })) return error.QueueFull;
+        const queued: QueuedUserMessage = .{
+            .prompt = owned,
+            .images = images,
+            .steer = input.steer,
+            .raw = input.raw,
+        };
+        if (!self.message_queue.push(&self.message_queue_storage, queued)) return error.QueueFull;
     }
 
-    /// Queue a machine-generated user message delivered verbatim (no `@`-mention
-    /// expansion or skill prefixing) at the next turn boundary. Thread-safe — the
-    /// `BackgroundManager` callers reach it from the UI thread while the worker
-    /// may be draining the same queue. See `QueuedUserMessage.raw`.
+    pub fn enqueueUser(self: *Agent, content: []const u8) !void {
+        try self.enqueue(.{ .text = content });
+    }
+
+    /// Queue a user message marked to steer: it is injected after the current
+    /// tool batch rather than waiting for the turn to go idle.
+    pub fn enqueueSteering(self: *Agent, content: []const u8) !void {
+        try self.enqueue(.{ .text = content, .steer = true });
+    }
+
+    /// Queue a machine-generated user message delivered verbatim. See
+    /// `QueuedInput.raw`.
     pub fn enqueueRaw(self: *Agent, content: []const u8) !void {
-        assert(content.len > 0);
-        const owned = try self.gpa.dupe(u8, content);
-        errdefer self.gpa.free(owned);
+        try self.enqueue(.{ .text = content, .raw = true });
+    }
+
+    /// How many user messages are waiting. Feeds the RPC `queue_update` event and
+    /// `pendingMessageCount` in the state snapshot.
+    pub fn queuedCount(self: *Agent) u32 {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
-        if (!self.message_queue.push(&self.message_queue_storage, .{ .prompt = owned, .raw = true })) return error.QueueFull;
+        return self.message_queue.len();
     }
 
     /// Whether any user message is waiting in the queue. The UI uses this to
@@ -235,7 +285,7 @@ pub const Agent = struct {
     /// Expand `@`-mentions in `prompt` (embedding text files inline, attaching
     /// images as real content blocks) and append the result as a user message.
     /// Reads files, so this is meant to run on the agent worker thread.
-    pub fn addUserPrompt(self: *Agent, prompt: []const u8) !void {
+    pub fn addUserPrompt(self: *Agent, prompt: []const u8, images: []const ai.ImageBlock) !void {
         // A turn interrupted mid-tool-batch leaves the assistant's `tool_call`s
         // with no matching tool result. Providers reject a turn whose history has
         // a tool_use without a corresponding tool_result, so fill them in before
@@ -243,7 +293,7 @@ pub const Agent = struct {
         // assistant call, ahead of the new user turn.
         try self.reconcileInterruptedToolCalls();
 
-        const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.cwd, prompt);
+        const blocks = try at_mention.buildUserMessage(self.gpa, self.io, self.cwd, prompt, images);
         errdefer {
             for (blocks) |*block| block.deinit(self.gpa);
             self.gpa.free(blocks);
@@ -339,6 +389,7 @@ pub const Agent = struct {
         response_delta: []const u8,
         tool_delta: ai.ToolDelta,
         delta_end,
+        tool_call_started: ToolCallStarted,
         tool_call_finished: ToolCallFinished,
         tool_batch_finished,
         queued_messages_flushed: u32,
@@ -347,21 +398,33 @@ pub const Agent = struct {
         history_compacted: HistoryCompacted,
 
         /// Emitted after the agent replaces summarized history with a compaction
-        /// summary. Token counts are estimates for display only.
+        /// summary. Token counts are estimates.
         pub const HistoryCompacted = struct {
             tokens_before: u32,
             tokens_after: u32,
         };
 
+        /// A tool is about to run. `arguments` is the complete argument JSON, so a
+        /// consumer that missed the streamed deltas still has the full call.
+        pub const ToolCallStarted = struct {
+            index: u32,
+            call_id: []const u8,
+            name: []const u8,
+            arguments: []const u8,
+        };
+
+        /// A tool finished. `content` is the observation — the same text that goes
+        /// into history — and `details_json`, when present, is a complete JSON
+        /// object of structured extras.
         pub const ToolCallFinished = struct {
             index: u32,
             call_id: []const u8 = "",
             name: []const u8,
-            display_label: []const u8,
-            display_expanded_label: ?[]const u8 = null,
-            display_body: []const u8,
-            display_kind: tools.DisplayKind = .text,
-            stderr: ?[]const u8 = null,
+            content: []const u8,
+            details_json: ?[]const u8 = null,
+            /// An image the tool attached, borrowed. Clients that render tool
+            /// results put it in the result content alongside the text.
+            image: ?ai.ImageBlock = null,
             failed: bool = false,
         };
 
@@ -372,13 +435,20 @@ pub const Agent = struct {
                     gpa.free(tool.name);
                     gpa.free(tool.arguments);
                 },
+                .tool_call_started => |tool| {
+                    gpa.free(tool.call_id);
+                    gpa.free(tool.name);
+                    gpa.free(tool.arguments);
+                },
                 .tool_call_finished => |tool| {
                     gpa.free(tool.call_id);
                     gpa.free(tool.name);
-                    gpa.free(tool.display_label);
-                    if (tool.display_expanded_label) |label| gpa.free(label);
-                    gpa.free(tool.display_body);
-                    if (tool.stderr) |stderr| gpa.free(stderr);
+                    gpa.free(tool.content);
+                    if (tool.details_json) |details| gpa.free(details);
+                    if (tool.image) |attached| {
+                        gpa.free(attached.mime_type);
+                        gpa.free(attached.data_base64);
+                    }
                 },
                 .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted => {},
             }
@@ -407,60 +477,76 @@ pub const Agent = struct {
     };
 
     pub fn run(self: *Agent, listener: Listener) !void {
-        try listener.emit(.turn_started);
         const tool_call_limit = 100;
         var calls: u32 = 0;
         while (calls < tool_call_limit) : (calls += 1) {
-            self.maybeCompact(listener);
-            var stream_context: StreamContext = .{
-                .agent = self,
-                .listener = listener,
-            };
-            defer stream_context.deinit();
-            var turn = try self.client.prompt(self.messages(), .{
-                .ptr = &stream_context,
-                .on_content = onContentDelta,
-                .on_reasoning = onReasoningDelta,
-                .on_tool_delta = onToolDelta,
-                .on_delta_end = onDeltaEnd,
-            });
-            const usage = turn.usage;
-            var turn_owned = true;
-            defer if (turn_owned) turn.deinit(self.gpa);
-
-            const tool_calls = try self.collectToolCalls(turn.assistant);
-            defer self.gpa.free(tool_calls);
-            if (turn.assistant.content.len > 0) {
-                try self.takeAssistantMessage(&turn.assistant);
-                turn_owned = false;
-            } else {
-                turn.deinit(self.gpa);
-                turn_owned = false;
-            }
-            // Anchor after the assistant reply is in history: `usage` accounts
-            // for everything up to and including it; later appends are trailing.
-            self.recordUsage(usage);
-
-            if (tool_calls.len == 0) {
-                // Turn would otherwise go idle: drain the front queued message
-                // (steer or not) and continue, so anything still waiting is
-                // handled at the natural turn end.
-                const drained_count = try self.drainQueuedUserMessage(false);
-                if (drained_count > 0) {
-                    try listener.emit(.{ .queued_messages_flushed = drained_count });
-                    continue;
-                }
-                return;
-            }
-            try self.runToolBatch(ToolBatch.init(tool_calls), &stream_context, listener);
-            // Mid-turn we only inject messages explicitly marked to steer, and
-            // only from the front so FIFO order holds — a default-queued
-            // message ahead of a steer one keeps it waiting for turn end.
-            var steered: u32 = 0;
-            while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
-            if (steered > 0) try listener.emit(.{ .queued_messages_flushed = steered });
+            try listener.emit(.turn_started);
+            const outcome = try self.runOneTurn(listener);
+            try listener.emit(.turn_finished);
+            if (outcome == .settled) return;
         }
         return error.ToolCallLimit;
+    }
+
+    /// What `runOneTurn` decided: whether the agent has more to say.
+    const TurnOutcome = enum {
+        /// Tool calls to answer, or a queued message that was just delivered.
+        continues,
+        /// The assistant replied with no tool calls and nothing is queued.
+        settled,
+    };
+
+    /// One assistant response and the tool calls it asked for. `run` owns the
+    /// loop and the turn events; this owns what happens inside a turn.
+    fn runOneTurn(self: *Agent, listener: Listener) !TurnOutcome {
+        self.maybeCompact(listener);
+        var stream_context: StreamContext = .{
+            .agent = self,
+            .listener = listener,
+        };
+        defer stream_context.deinit();
+        var turn = try self.client.prompt(self.messages(), .{
+            .ptr = &stream_context,
+            .on_content = onContentDelta,
+            .on_reasoning = onReasoningDelta,
+            .on_tool_delta = onToolDelta,
+            .on_delta_end = onDeltaEnd,
+        });
+        const usage = turn.usage;
+        var turn_owned = true;
+        defer if (turn_owned) turn.deinit(self.gpa);
+
+        const tool_calls = try self.collectToolCalls(turn.assistant);
+        defer self.gpa.free(tool_calls);
+        if (turn.assistant.content.len > 0) {
+            try self.takeAssistantMessage(&turn.assistant);
+            turn_owned = false;
+        } else {
+            turn.deinit(self.gpa);
+            turn_owned = false;
+        }
+        // Anchor after the assistant reply is in history: `usage` accounts
+        // for everything up to and including it; later appends are trailing.
+        self.recordUsage(usage);
+
+        if (tool_calls.len == 0) {
+            // Turn would otherwise go idle: drain the front queued message
+            // (steer or not) and continue, so anything still waiting is
+            // handled at the natural turn end.
+            const drained_count = try self.drainQueuedUserMessage(false);
+            if (drained_count == 0) return .settled;
+            try listener.emit(.{ .queued_messages_flushed = drained_count });
+            return .continues;
+        }
+
+        try self.runToolBatch(ToolBatch.init(tool_calls), &stream_context, listener);
+        // Mid-turn we only inject messages explicitly marked to steer, and
+        // only from the front so FIFO order holds — a default-queued
+        // message ahead of a steer one keeps it waiting for turn end.
+        var steered: u32 = 0;
+        while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
+        if (steered > 0) try listener.emit(.{ .queued_messages_flushed = steered });
+        return .continues;
     }
 
     /// Hand the batch of tool_calls to the ExecutorService, bridge its
@@ -496,91 +582,7 @@ pub const Agent = struct {
         defer self.gpa.free(results);
         errdefer for (results) |*r| r.deinit(self.gpa);
         try self.takeToolResults(results);
-        _ = self.snapshotNow();
         try listener.emit(.tool_batch_finished);
-    }
-
-    pub const SnapshotOutcome = enum {
-        sealed,
-        unchanged,
-        no_leaf,
-        unavailable,
-        failed,
-    };
-
-    /// Snapshot the working tree (git-shadow) and bind the commit to the active
-    /// conversation leaf, so navigating back here restores this code state.
-    ///
-    /// The single snapshot entry point: the tool loop calls it after every batch,
-    /// the workspace at turn boundaries. Both share the dedup and chain state, so
-    /// a checkpoint means the same thing wherever it is taken.
-    ///
-    /// Change detection never trusts tool output — the content-addressed tree id
-    /// is compared to the last snapshot's, and an unchanged tree (a read-only
-    /// batch, or a build that only touched gitignored files) writes nothing.
-    ///
-    /// Snapshots chain: each commit's parent is the previous snapshot on this
-    /// timeline, so the tip reaches every snapshot behind it and one ref at the
-    /// tip keeps the whole chain alive. That makes the previous tip's ref
-    /// redundant, and dropping it holds the ref count at one per timeline tip
-    /// rather than one per snapshot. The chain is still entirely off-branch.
-    pub fn snapshotNow(self: *Agent) SnapshotOutcome {
-        if (self.snapshots_disabled) return .unavailable;
-        const session_writer = self.context_manager.session_writer orelse return .no_leaf;
-        const index = self.snapshot_index orelse blk: {
-            if (!vcs.isAvailable(self.gpa, self.io) or !vcs.isRepo(self.gpa, self.io, self.cwd)) {
-                self.snapshots_disabled = true;
-                return .unavailable;
-            }
-            const path = vcs.indexPath(self.gpa, self.io, self.cwd) catch {
-                self.snapshots_disabled = true;
-                return .unavailable;
-            };
-            self.snapshot_index = path;
-            break :blk path;
-        };
-
-        const parent = self.resolveSnapshotParent(session_writer);
-
-        const tree = vcs.workingTreeId(self.gpa, self.io, self.cwd, index) catch return .failed;
-        if (self.last_snapshot_tree) |last| {
-            if (tree.eql(last)) return .unchanged; // nothing tracked changed — no node
-        }
-        const commit = vcs.commitTree(self.gpa, self.io, self.cwd, tree, parent.commit) catch return .failed;
-        session_writer.setLeafSnapshot(commit.slice()) catch return .failed;
-        self.last_snapshot_tree = tree;
-        self.last_snapshot_commit = commit;
-
-        const leaf_raw = session_writer.leaf() orelse return .no_leaf;
-        const leaf = session_mod.EntryId.fromSlice(leaf_raw) catch return .failed;
-        const session_id = session_writer.session.id.slice();
-        vcs.keepRef(self.gpa, self.io, self.cwd, session_id, leaf.slice(), commit) catch {
-            self.last_snapshot_ref = parent.ref;
-            return .failed;
-        };
-
-        if (parent.ref) |old| {
-            if (!std.mem.eql(u8, old.slice(), leaf.slice())) {
-                vcs.dropRef(self.gpa, self.io, self.cwd, session_id, old.slice()) catch {};
-            }
-        }
-        self.last_snapshot_ref = leaf;
-        return .sealed;
-    }
-
-    const SnapshotParent = struct {
-        commit: ?vcs.ObjectId = null,
-        ref: ?session_mod.EntryId = null,
-    };
-
-    fn resolveSnapshotParent(self: *Agent, session_writer: *session_mod.SessionWriter) SnapshotParent {
-        if (self.last_snapshot_commit) |commit| {
-            return .{ .commit = commit, .ref = self.last_snapshot_ref };
-        }
-        var binding = (session_writer.snapshotAt(self.gpa) catch null) orelse return .{};
-        defer binding.deinit(self.gpa);
-        const commit = vcs.ObjectId.parse(binding.sha) catch return .{};
-        return .{ .commit = commit, .ref = binding.entry_id };
     }
 
     /// Bridges ExecutorService's `ToolCallObserver` callbacks into the
@@ -594,36 +596,31 @@ pub const Agent = struct {
 
         fn onStarted(ptr: *anyopaque, call: ai.ToolCall) anyerror!void {
             const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            // Synthesise a tool_delta for the TUI if the LM did not stream
-            // one for this tool_call (some servers emit the whole call in
-            // one shot without intermediate deltas).
+            // Synthesise a tool_delta when the LM emitted the whole call in one
+            // shot without intermediate deltas, so a consumer assembling the call
+            // from deltas still sees it.
             if (!self.stream_context.toolDeltaSeen(self.tool_index)) {
-                try self.agent.emitToolDelta(self.listener, self.tool_index, call.name, call.arguments);
+                try emitToolDelta(self.agent.gpa, self.listener, self.tool_index, call.name, call.arguments);
                 try self.listener.emit(.delta_end);
             }
+            try emitToolCallStarted(self.agent.gpa, self.listener, self.tool_index, call);
         }
 
         fn onFinished(ptr: *anyopaque, result: *const executor_mod.ToolResult) anyerror!void {
             const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            try self.agent.emitToolCallFinished(
-                self.listener,
-                self.tool_index,
-                result.call_id,
-                result.name,
-                result.display_label,
-                result.display_expanded_label,
-                result.display_body,
-                result.display_kind,
-                result.stderr,
-                result.failed,
-            );
+            try emitToolCallFinished(self.agent.gpa, self.listener, self.tool_index, result);
             self.tool_index += 1;
         }
 
+        /// Gate a command the safety classifier flagged. With no approval hook
+        /// attached this **fails closed** — the call is rejected rather than run.
+        /// That is deliberate: the hook existed for an interactive prompt, and
+        /// defaulting to "approved" when nobody is asked would make the classifier
+        /// decorative. A client that wants to decide should set `bash_approval`.
         fn approveUnsafeBash(ptr: *anyopaque, call: ai.ToolCall, command: []const u8) anyerror!bool {
             _ = call;
             const self: *ExecutorBridge = @ptrCast(@alignCast(ptr));
-            const approval = self.agent.bash_approval orelse return true;
+            const approval = self.agent.bash_approval orelse return false;
             return approval.request(approval.ptr, command);
         }
     };
@@ -667,7 +664,7 @@ pub const Agent = struct {
     fn onToolDelta(context: *anyopaque, delta: ai.ToolDelta) anyerror!void {
         const concrete: *StreamContext = @ptrCast(@alignCast(context));
         try concrete.markToolDeltaSeen(delta.index);
-        try concrete.agent.emitToolDelta(concrete.listener, delta.index, delta.name, delta.arguments);
+        try emitToolDelta(concrete.agent.gpa, concrete.listener, delta.index, delta.name, delta.arguments);
     }
 
     fn onDeltaEnd(context: *anyopaque) anyerror!void {
@@ -675,17 +672,21 @@ pub const Agent = struct {
         try concrete.listener.emit(.delta_end);
     }
 
+    /// Tool-lifecycle events carry owned copies: `Event.deinit` frees them, so
+    /// the listener may outlive the call and result these came from. That costs a
+    /// copy of an attached image, which is why `view_image` caps how large one
+    /// can be.
     fn emitToolDelta(
-        self: *Agent,
+        gpa: std.mem.Allocator,
         listener: Listener,
         tool_index: u32,
         name: []const u8,
         arguments: []const u8,
     ) !void {
-        const owned_name = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned_name);
-        const owned_arguments = try self.gpa.dupe(u8, arguments);
-        errdefer self.gpa.free(owned_arguments);
+        const owned_name = try gpa.dupe(u8, name);
+        errdefer gpa.free(owned_name);
+        const owned_arguments = try gpa.dupe(u8, arguments);
+        errdefer gpa.free(owned_arguments);
         try listener.emit(.{
             .tool_delta = .{
                 .index = tool_index,
@@ -695,50 +696,62 @@ pub const Agent = struct {
         });
     }
 
-    fn emitToolCallFinished(
-        self: *Agent,
+    fn emitToolCallStarted(
+        gpa: std.mem.Allocator,
         listener: Listener,
         tool_index: u32,
-        call_id: []const u8,
-        name: []const u8,
-        display_label: []const u8,
-        display_expanded_label: ?[]const u8,
-        display_body: []const u8,
-        display_kind: tools.DisplayKind,
-        stderr: ?[]const u8,
-        failed: bool,
+        call: ai.ToolCall,
     ) !void {
-        const owned_id = try self.gpa.dupe(u8, call_id);
-        errdefer self.gpa.free(owned_id);
-        const owned_name = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned_name);
-        const owned_label = try self.gpa.dupe(u8, display_label);
-        errdefer self.gpa.free(owned_label);
-        const owned_expanded_label: ?[]u8 = if (display_expanded_label) |label|
-            try self.gpa.dupe(u8, label)
+        const owned_id = try gpa.dupe(u8, call.call_id);
+        errdefer gpa.free(owned_id);
+        const owned_name = try gpa.dupe(u8, call.name);
+        errdefer gpa.free(owned_name);
+        const owned_arguments = try gpa.dupe(u8, call.arguments);
+        errdefer gpa.free(owned_arguments);
+        try listener.emit(.{ .tool_call_started = .{
+            .index = tool_index,
+            .call_id = owned_id,
+            .name = owned_name,
+            .arguments = owned_arguments,
+        } });
+    }
+
+    fn emitToolCallFinished(
+        gpa: std.mem.Allocator,
+        listener: Listener,
+        tool_index: u32,
+        result: *const executor_mod.ToolResult,
+    ) !void {
+        const owned_id = try gpa.dupe(u8, result.call_id);
+        errdefer gpa.free(owned_id);
+        const owned_name = try gpa.dupe(u8, result.name);
+        errdefer gpa.free(owned_name);
+        const owned_content = try gpa.dupe(u8, result.content);
+        errdefer gpa.free(owned_content);
+        const owned_details: ?[]u8 = if (result.details_json) |details|
+            try gpa.dupe(u8, details)
         else
             null;
-        errdefer if (owned_expanded_label) |label| self.gpa.free(label);
-        const owned_body = try self.gpa.dupe(u8, display_body);
-        errdefer self.gpa.free(owned_body);
-        const owned_stderr: ?[]u8 = if (stderr) |s|
-            try self.gpa.dupe(u8, s)
-        else
-            null;
-        errdefer if (owned_stderr) |s| self.gpa.free(s);
-        try listener.emit(.{
-            .tool_call_finished = .{
-                .index = tool_index,
-                .call_id = owned_id,
-                .name = owned_name,
-                .display_label = owned_label,
-                .display_expanded_label = owned_expanded_label,
-                .display_body = owned_body,
-                .display_kind = display_kind,
-                .stderr = owned_stderr,
-                .failed = failed,
-            },
-        });
+        errdefer if (owned_details) |details| gpa.free(details);
+        const owned_image: ?ai.ImageBlock = if (result.image) |attached| blk: {
+            const mime = try gpa.dupe(u8, attached.mime_type);
+            errdefer gpa.free(mime);
+            const data = try gpa.dupe(u8, attached.data_base64);
+            break :blk .{ .mime_type = mime, .data_base64 = data };
+        } else null;
+        errdefer if (owned_image) |attached| {
+            gpa.free(attached.mime_type);
+            gpa.free(attached.data_base64);
+        };
+        try listener.emit(.{ .tool_call_finished = .{
+            .index = tool_index,
+            .call_id = owned_id,
+            .name = owned_name,
+            .content = owned_content,
+            .details_json = owned_details,
+            .image = owned_image,
+            .failed = result.failed,
+        } });
     }
 
     fn appendMessage(self: *Agent, role: ai.Role, content: []const u8) !void {
@@ -758,11 +771,12 @@ pub const Agent = struct {
 
     fn drainQueuedUserMessage(self: *Agent, steer_only: bool) !u32 {
         const queued = self.takeQueuedUserMessage(steer_only) orelse return 0;
-        defer self.gpa.free(queued.prompt);
+        var owned = queued;
+        defer owned.deinit(self.gpa);
         // Raw (machine-generated) messages bypass `@`-mention expansion and skill
         // prefixing so their body is never reinterpreted; user-typed prompts go
         // through the full expansion path.
-        if (queued.raw) try self.addUser(queued.prompt) else try self.addUserPrompt(queued.prompt);
+        if (owned.raw) try self.addUser(owned.prompt) else try self.addUserPrompt(owned.prompt, owned.images);
         return 1;
     }
 
@@ -782,7 +796,8 @@ pub const Agent = struct {
         self.lockMessageQueue();
         defer self.message_queue_mutex.unlock();
         while (self.message_queue.pop(&self.message_queue_storage)) |queued| {
-            self.gpa.free(queued.prompt);
+            var owned = queued;
+            owned.deinit(self.gpa);
         }
     }
 
@@ -844,20 +859,24 @@ pub const Agent = struct {
         }
         for (results) |*r| {
             assert(r.call_id.len > 0);
-            const blocks = try self.gpa.alloc(ai.ContentBlock, 1);
+            // Two blocks when the tool attached an image, one otherwise. The text
+            // always comes first and always stands alone, because the adapters
+            // drop the image for a model that cannot take one.
+            const block_count: usize = if (r.image == null) 1 else 2;
+            const blocks = try self.gpa.alloc(ai.ContentBlock, block_count);
             errdefer self.gpa.free(blocks);
+            // `content`, `call_id` and the image move into history; everything
+            // else the result owned was already copied into the emitted event.
             blocks[0] = .{ .text = .{ .text = r.content } };
+            if (r.image) |attached| blocks[1] = .{ .image = attached };
             try self.context_manager.appendPersisted(.{
                 .role = .tool,
                 .content = blocks,
                 .call_id = r.call_id,
-                .tool_display_label = r.display_label,
                 .tool_failed = r.failed,
             });
             self.gpa.free(r.name);
-            if (r.display_expanded_label) |label| self.gpa.free(label);
-            self.gpa.free(r.display_body);
-            if (r.stderr) |s| self.gpa.free(s);
+            if (r.details_json) |details| self.gpa.free(details);
             r.* = undefined;
             moved += 1;
         }
@@ -1253,70 +1272,4 @@ test "clear queue drops messages without delivering them" {
 
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), agent.messages().len);
-}
-
-// End-to-end ref accounting for the snapshot chain, driven through the real
-// `Agent.snapshotNow` against a real git repo and a real session writer. This is
-// the property the design rests on: ref count tracks timeline *tips*, not
-// snapshots, and superseded snapshots stay reachable as ancestors anyway.
-test "snapshotNow chains commits and keeps one ref per timeline tip" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    if (!vcs.isAvailable(gpa, io)) return error.SkipZigTest;
-
-    var repo = try git_test.TempRepo.init(gpa, io, "nova-agentchain");
-    defer repo.deinit();
-
-    // The session DB lands in `<repo>/.nova`, so ignore it: otherwise every write
-    // to it would change the snapshot tree and the no-op case below could never
-    // be observed. Production keeps the DB outside the repo for the same reason.
-    try repo.writeFile(".gitignore", ".nova/\n");
-
-    var writer: session_mod.SessionWriter = undefined;
-    try writer.initDefault(gpa, io, repo.path, repo.path);
-    defer writer.deinit();
-
-    var agent = Agent.init(gpa, io, repo.path, .none);
-    defer agent.deinit();
-    agent.attachSessionWriter(&writer);
-
-    const session_id = writer.session.id.slice();
-
-    // Three file-changing steps, each with its own conversation entry, so each
-    // snapshot binds to a distinct leaf.
-    var tips: [3]vcs.ObjectId = undefined;
-    for (0..3) |step| {
-        const body = try std.fmt.allocPrint(gpa, "step {d}", .{step});
-        defer gpa.free(body);
-        try agent.addUser(body);
-        try repo.writeFile("tracked.txt", body);
-        try std.testing.expectEqual(Agent.SnapshotOutcome.sealed, agent.snapshotNow());
-        tips[step] = agent.last_snapshot_commit.?;
-    }
-
-    // A linear chain of exactly three commits reachable from the tip — not three
-    // parentless orphans, which would each count 1.
-    try std.testing.expectEqual(@as(usize, 3), try repo.revListCount(tips[2].slice()));
-    try std.testing.expectEqual(@as(usize, 1), try repo.revListCount(tips[0].slice()));
-
-    // Three snapshots, one ref: the superseded refs were dropped as the tip moved
-    // past them, and the survivor points at the newest snapshot.
-    {
-        const refs = try repo.sessionRefs(session_id);
-        defer repo.freeRefs(refs);
-        try std.testing.expectEqual(@as(usize, 1), refs.len);
-        try repo.expectResolvesTo(refs[0], tips[2].slice());
-    }
-
-    // A batch that changes nothing writes no commit and no ref.
-    try std.testing.expectEqual(Agent.SnapshotOutcome.unchanged, agent.snapshotNow());
-    try std.testing.expectEqual(@as(usize, 1), try repo.sessionRefCount(session_id));
-
-    // gc must keep all three: the two older ones are reachable only as ancestors
-    // of the tip now that their own refs are gone.
-    try repo.gcPruneNow();
-    for (tips) |commit| try repo.expectCommitAlive(commit);
-
-    // HEAD never moved: the chain is entirely off-branch.
-    try std.testing.expectEqual(@as(usize, 1), try repo.headCommitCount());
 }

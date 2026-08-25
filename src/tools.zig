@@ -3,14 +3,16 @@ const std = @import("std");
 const bash_tool = @import("tools/bash.zig");
 const common = @import("tools/common.zig");
 const edit_text = @import("tools/edit_text.zig");
+const workspace_path = @import("tools/workspace_path.zig");
 const edit_tool = @import("tools/edit.zig");
 const write_tool = @import("tools/write.zig");
 const search_tools = @import("tools/search_tools.zig");
+const view_image_tool = @import("tools/view_image.zig");
+const zoom_tool = @import("tools/zoom.zig");
 
 const assert = std.debug.assert;
 
 pub const Output = common.Output;
-pub const DisplayKind = common.DisplayKind;
 pub const Error = common.Error;
 pub const Tool = common.Tool;
 pub const Schema = common.Schema;
@@ -22,6 +24,8 @@ pub const registry: []const Tool = &.{
     write_tool.tool,
     search_tools.find_tool,
     search_tools.grep_tool,
+    view_image_tool.tool,
+    zoom_tool.tool,
 };
 
 pub fn run(
@@ -100,8 +104,11 @@ test "lookup returns null for unknown tool" {
 test {
     _ = bash_tool;
     _ = edit_text;
+    _ = workspace_path;
     _ = edit_tool;
     _ = write_tool;
     _ = search_tools;
+    _ = view_image_tool;
+    _ = zoom_tool;
     _ = common;
 }

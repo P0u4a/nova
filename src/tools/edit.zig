@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const workspace_path = @import("workspace_path.zig");
 const edit_text = @import("edit_text.zig");
 
 const assert = std.debug.assert;
@@ -27,7 +28,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "path",
                 .kind = .string,
-                .description = "File to edit. Relative to the project unless absolute.",
+                .description = "File to edit. Relative to the project unless absolute; must stay inside the project.",
                 .required = true,
             },
             .{
@@ -52,7 +53,6 @@ pub const tool: common.Tool = .{
         },
     },
     .run = run,
-    .display = display,
 };
 
 const JsonEdit = struct {
@@ -105,10 +105,17 @@ pub fn run(
         return common.failFmt(gpa, 2, "edit {s}: provide `edits` (or a single `old_text`/`new_text` pair).\n", .{path});
     }
 
-    const absolute = common.joinPath(gpa, cwd, path) catch return error.OutOfMemory;
-    defer gpa.free(absolute);
+    // Resolve before reading: the path came from the model, so it is checked for
+    // traversal and symlinks and we operate on the verified parent handle rather
+    // than on a string.
+    var resolved = workspace_path.resolve(gpa, io, cwd, path, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        var buffer: [512]u8 = undefined;
+        return common.failFmt(gpa, 2, "{s}\n", .{workspace_path.describe(err, "edit", path, &buffer)});
+    };
+    defer resolved.deinit(gpa, io);
 
-    const original = common.readFileBytes(gpa, io, absolute, file_bytes_max) catch |err| {
+    const original = readVerified(gpa, io, &resolved) catch |err| {
         return common.failFmt(gpa, 2, "edit {s}: {s}\n", .{ path, readErrorText(err) });
     };
     defer gpa.free(original);
@@ -134,7 +141,7 @@ pub fn run(
 
     const restored = try edit_text.restoreLineEndings(gpa, applied.updated, ending);
     defer gpa.free(restored);
-    try writeFile(gpa, io, absolute, restored, had_bom);
+    try writeFile(io, &resolved, restored, had_bom);
 
     const counts = edit_text.countChanges(applied.base, applied.updated);
     const observation = try std.fmt.allocPrint(
@@ -152,17 +159,29 @@ pub fn run(
         },
     );
     errdefer gpa.free(observation);
-    const diff = try edit_text.renderDiff(gpa, path, applied.base, applied.updated, diff_context);
-    errdefer gpa.free(diff);
+    const details = try diffDetails(gpa, path, applied.base, applied.updated);
+    errdefer gpa.free(details);
 
     const stderr = try gpa.alloc(u8, 0);
     return .{
         .stdout = observation,
         .stderr = stderr,
         .code = 0,
-        .display = diff,
-        .display_kind = .diff,
+        .details_json = details,
     };
+}
+
+/// The tool result's `details`: a JSON object carrying the diff this edit
+/// produced, so a client can show the change without re-reading the file.
+fn diffDetails(gpa: std.mem.Allocator, path: []const u8, before: []const u8, after: []const u8) ![]u8 {
+    const diff = try edit_text.renderDiff(gpa, path, before, after, diff_context);
+    defer gpa.free(diff);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    out.writer.writeAll("{\"diff\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(diff, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
 }
 
 /// Flatten the accepted argument shapes into one edit list: an `edits` array, a
@@ -190,15 +209,26 @@ fn collectEdits(
     }
 }
 
-fn writeFile(
+/// Read the whole file through the verified parent handle, refusing to follow the
+/// target if it turned into a symlink since `resolve` checked it.
+fn readVerified(
     gpa: std.mem.Allocator,
     io: std.Io,
-    absolute: []const u8,
+    resolved: *const workspace_path.Resolved,
+) ![]u8 {
+    var file = try resolved.openFile(io);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(gpa, .limited(file_bytes_max));
+}
+
+fn writeFile(
+    io: std.Io,
+    resolved: *const workspace_path.Resolved,
     content: []const u8,
     with_bom: bool,
 ) common.Error!void {
-    _ = gpa;
-    var file = std.Io.Dir.createFile(.cwd(), io, absolute, .{ .truncate = true }) catch return error.Unexpected;
+    var file = resolved.createFile(io) catch return error.Unexpected;
     defer file.close(io);
     var buffer: [4096]u8 = undefined;
     var writer = file.writer(io, &buffer);
@@ -216,16 +246,6 @@ fn readErrorText(err: anyerror) []const u8 {
         else => "could not read the file.",
     };
 }
-
-pub fn display(gpa: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
-    const path = try common.extractStringField(gpa, arguments, "path", "edit");
-    errdefer gpa.free(path);
-    const label = try std.fmt.allocPrint(gpa, "Edit {s}", .{path});
-    gpa.free(path);
-    return .{ .label = label };
-}
-
-// === tests ==================================================================
 
 /// Run the tool against a scratch file and return its `Output`.
 fn runInTemp(
@@ -270,7 +290,7 @@ test "edit replaces text and reports a diff" {
     );
     defer output.deinit(gpa);
     try std.testing.expectEqual(@as(u8, 0), output.code);
-    try std.testing.expectEqual(common.DisplayKind.diff, output.display_kind);
+    try std.testing.expect(output.details_json != null);
     try std.testing.expect(std.mem.indexOf(u8, output.stdout, "1 replacement(s)") != null);
 
     const content = try readTemp(gpa, io, "a.txt");
@@ -330,9 +350,30 @@ test "edit on a missing file points at write" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "write") != null);
 }
 
-test "edit display names the file" {
+test "edit refuses a path that escapes the project and leaves the target alone" {
     const gpa = std.testing.allocator;
-    var shown = try display(gpa, "{\"path\":\"src/main.zig\"}");
-    defer shown.deinit(gpa);
-    try std.testing.expectEqualStrings("Edit src/main.zig", shown.label);
+    const io = std.testing.io;
+    // A real file just outside the tool's working directory, so the test proves
+    // the edit was refused rather than merely erroring on a missing file.
+    const outside_rel = ".zig-cache/edit-escape-target.txt";
+    {
+        var file = try std.Io.Dir.createFile(.cwd(), io, outside_rel, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "untouched\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, outside_rel) catch {};
+
+    var output = try runInTemp(gpa, io, "unused.txt", null,
+        \\{"path":"../edit-escape-target.txt","old_text":"untouched","new_text":"owned"}
+    );
+    defer output.deinit(gpa);
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "outside the workspace") != null);
+
+    var file = try std.Io.Dir.cwd().openFile(io, outside_rel, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const after = try reader.interface.allocRemaining(gpa, .limited(64));
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings("untouched\n", after);
 }

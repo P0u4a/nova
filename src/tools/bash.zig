@@ -36,7 +36,6 @@ pub const tool: common.Tool = .{
         } },
     },
     .run = runTool,
-    .display = display,
 };
 
 pub fn runTool(
@@ -425,40 +424,6 @@ fn mapBashError(err: anyerror) common.Error {
         error.Canceled => error.Canceled,
         else => error.Unexpected,
     };
-}
-
-/// The bash display summary is the model-provided reason; the expanded title
-/// is the executable command, so users can inspect exactly what ran.
-fn display(gpa: std.mem.Allocator, args: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
-    const parsed = std.json.parseFromSlice(JsonArgs, gpa, args, .{ .ignore_unknown_fields = true }) catch {
-        return .{ .label = try gpa.dupe(u8, "bash") };
-    };
-    defer parsed.deinit();
-    const reason = parsed.value.reason orelse return .{ .label = try gpa.dupe(u8, "bash") };
-    if (reason.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
-    const command = parsed.value.command orelse return .{ .label = try gpa.dupe(u8, "bash") };
-    if (command.len == 0) return .{ .label = try gpa.dupe(u8, "bash") };
-
-    const label = try gpa.dupe(u8, reason);
-    errdefer gpa.free(label);
-    const expanded_label = try gpa.dupe(u8, command);
-    return .{ .label = label, .expanded_label = expanded_label };
-}
-
-test "bash display uses reason with command as expanded label" {
-    const gpa = std.testing.allocator;
-    var label = try display(gpa, "{\"command\":\"pwd\",\"reason\":\"Inspect the current directory\"}");
-    defer label.deinit(gpa);
-    try std.testing.expectEqualStrings("Inspect the current directory", label.label);
-    try std.testing.expectEqualStrings("pwd", label.expanded_label.?);
-}
-
-test "bash display falls back on partial JSON" {
-    const gpa = std.testing.allocator;
-    var label = try display(gpa, "{\"command");
-    defer label.deinit(gpa);
-    try std.testing.expectEqualStrings("bash", label.label);
-    try std.testing.expect(label.expanded_label == null);
 }
 
 test "bash tool applies env object" {

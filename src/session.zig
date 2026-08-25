@@ -81,6 +81,22 @@ pub const SessionManager = struct {
         return init(gpa, io, db_path);
     }
 
+    /// A second connection to an already-migrated database, for reads only.
+    ///
+    /// WAL lets a reader run concurrently with the writer, which is the whole
+    /// point: the `SessionWriter` keeps its write connection on the background
+    /// thread and serves projections from one of these instead of stopping that
+    /// thread. Skips `migrate` — the schema is the write connection's business,
+    /// and a read-only handle could not run DDL anyway.
+    pub fn initRead(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Error!SessionManager {
+        assert(path.len > 0);
+        var connection = try db.Connection.open(path, .{ .readonly = true, .readwrite = false, .create = false });
+        errdefer connection.close();
+        // Readers wait rather than fail if the writer holds the lock mid-commit.
+        try connection.exec("pragma busy_timeout = 5000");
+        return .{ .gpa = gpa, .io = io, .connection = connection };
+    }
+
     pub fn deinit(self: *SessionManager) void {
         self.connection.close();
         self.* = undefined;
@@ -220,24 +236,6 @@ pub const Session = struct {
         try expectDone(&statement);
     }
 
-    pub fn branch(self: *Session, entry_id: []const u8, summary: ?[]const u8, id_out: ?*[entry_id_len]u8) Error!void {
-        assert(entry_id.len > 0);
-        if (entry_id.len != entry_id_len) return error.BadEntryId;
-        try self.requireEntry(entry_id);
-        if (summary) |text| {
-            const out = id_out orelse return error.BadEntryId;
-            fillHex(self.manager.io, out);
-            const payload = try branchSummaryToJson(self.manager.gpa, entry_id, text);
-            defer self.manager.gpa.free(payload);
-            try self.insertEntryWithParent(out, entry_id, "branch_summary", null, payload);
-        } else {
-            var buffer: [entry_id_len]u8 = undefined;
-            @memcpy(buffer[0..], entry_id);
-            self.leaf_entry_id = .{ .bytes = buffer };
-            try self.updateLeaf(entry_id);
-        }
-    }
-
     /// Append a compaction boundary as a child of the current leaf. `summary`
     /// (with any handover framing already applied by the caller) stands in for
     /// every entry before `first_kept_id` in the projected context. Validates
@@ -254,55 +252,12 @@ pub const Session = struct {
         try self.insertEntry(id_out, "compaction", null, payload);
     }
 
-    // === git-shadow snapshots ==============================================
     //
     // Each entry can carry a git commit id (`snapshot`) binding it to the code
     // state *at* that conversation node. Unlike the old `checkpoint` child
     // entries, the id lives ON the entry, so navigating to a node reads its own
     // (or its nearest ancestor's) snapshot directly — no descendant scan, no
     // off-by-one. Written by the harness after a file-changing step.
-
-    /// Record `sha` (a git commit id) as the code state at `entry_id`.
-    pub fn setSnapshot(self: *Session, entry_id: []const u8, sha: []const u8) Error!void {
-        assert(entry_id.len == entry_id_len);
-        assert(sha.len > 0);
-        var statement = try self.manager.connection.prepare("update session_entries set snapshot = ? where session_id = ? and id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, sha);
-        try statement.bindText(2, self.id.slice());
-        try statement.bindText(3, entry_id);
-        try expectDone(&statement);
-    }
-
-    /// The snapshot bound to the active conversation position: the nearest entry
-    /// at or above the leaf that carries one, walking leaf→root. Null when no
-    /// ancestor has one (a brand-new session before any file change).
-    ///
-    /// `entry_id` is returned alongside the sha because that entry names the ref
-    /// currently pinning this snapshot (`refs/nova/<session>/<entry>`) — chaining
-    /// a new snapshot onto it makes that ref redundant, and the caller needs the
-    /// id to drop it. Caller owns `sha`.
-    pub fn snapshotAt(self: *Session, gpa: std.mem.Allocator) Error!?SnapshotBinding {
-        const leaf_id = self.leaf_entry_id orelse return null;
-        var statement = try self.manager.connection.prepare(
-            \\with recursive anc(id, parent_id, snapshot, depth) as (
-            \\  select id, parent_id, snapshot, 0 from session_entries
-            \\    where session_id = ?1 and id = ?2
-            \\  union all
-            \\  select e.id, e.parent_id, e.snapshot, anc.depth + 1
-            \\    from session_entries e join anc on e.id = anc.parent_id
-            \\    where e.session_id = ?1
-            \\)
-            \\select id, snapshot from anc where snapshot is not null order by depth limit 1
-        );
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, leaf_id.slice());
-        const row = (try statement.step()) orelse return null;
-        if (row.columnType(1) == .null) return null;
-        const entry_id = try EntryId.fromSlice(row.text(0));
-        return .{ .entry_id = entry_id, .sha = try gpa.dupe(u8, row.text(1)) };
-    }
 
     /// Project the active branch into the message list the model sees. The
     /// durable tree is the source of truth; this is the derived view. When the
@@ -451,17 +406,29 @@ pub const Session = struct {
         return error.MissingEntry;
     }
 
-    /// Load every entry in the session (the whole tree, not just the active
-    /// path). Callers build the parent→children structure themselves. Entries
-    /// are returned oldest-first by creation time so siblings keep a stable
-    /// order. Caller owns the slice and each record.
-    pub fn entries(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
-        // `rowid` breaks created_at_ms ties so "oldest-first" is strictly
-        // insertion order — entries written in the same millisecond (tests, fast
-        // turns) keep a deterministic sequence, which the tree pre-order relies on.
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? order by created_at_ms, rowid");
+    /// Load the active branch root→leaf in one query.
+    ///
+    /// A recursive CTE walks parent links up from the leaf and orders by depth
+    /// descending, so rows arrive already in conversation order — no reversal, and
+    /// one statement instead of one round-trip per entry. This runs on every
+    /// projection, resume, and timeline jump, so it is the query that matters most.
+    fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
+        const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
+
+        var statement = try self.manager.connection.prepare(
+            \\with recursive anc(id, parent_id, kind, role, payload_json, created_at_ms, snapshot, depth) as (
+            \\  select id, parent_id, kind, role, payload_json, created_at_ms, snapshot, 0
+            \\    from session_entries where session_id = ?1 and id = ?2
+            \\  union all
+            \\  select e.id, e.parent_id, e.kind, e.role, e.payload_json, e.created_at_ms, e.snapshot, anc.depth + 1
+            \\    from session_entries e join anc on e.id = anc.parent_id
+            \\    where e.session_id = ?1
+            \\)
+            \\select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from anc order by depth desc
+        );
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
+        try statement.bindText(2, leaf_id.slice());
 
         var records: std.ArrayList(EntryRecord) = .empty;
         errdefer {
@@ -471,51 +438,53 @@ pub const Session = struct {
         while (try statement.step()) |row| {
             try records.append(gpa, try readEntry(gpa, &row));
         }
+        // The leaf itself must have come back; an empty result means the leaf
+        // pointer references an entry that no longer exists.
+        if (records.items.len == 0) return error.MissingEntry;
         return records.toOwnedSlice(gpa);
-    }
-
-    fn loadBranch(self: *Session, gpa: std.mem.Allocator) Error![]EntryRecord {
-        const leaf_id = self.leaf_entry_id orelse return try gpa.alloc(EntryRecord, 0);
-        var records: std.ArrayList(EntryRecord) = .empty;
-        errdefer {
-            for (records.items) |*record| record.deinit(gpa);
-            records.deinit(gpa);
-        }
-
-        var current = leaf_id;
-        while (true) {
-            const record = try self.loadEntry(gpa, current.slice());
-            const parent = record.parent_id;
-            try records.append(gpa, record);
-            if (parent) |value| {
-                current = .{ .bytes = value };
-            } else {
-                break;
-            }
-        }
-        std.mem.reverse(EntryRecord, records.items);
-        return records.toOwnedSlice(gpa);
-    }
-
-    fn loadEntry(self: *Session, gpa: std.mem.Allocator, entry_id: []const u8) Error!EntryRecord {
-        var statement = try self.manager.connection.prepare("select id, parent_id, kind, role, payload_json, created_at_ms, snapshot from session_entries where session_id = ? and id = ?");
-        defer statement.finalize();
-        try statement.bindText(1, self.id.slice());
-        try statement.bindText(2, entry_id);
-        const row = (try statement.step()) orelse return error.MissingEntry;
-        return readEntry(gpa, &row);
     }
 };
 
+/// Durable writer for one session, plus the read path onto it.
+///
+/// Appends are queued and drained by a background thread so a streaming turn
+/// never blocks on disk. Reads — projections, the tree for the timeline picker,
+/// the compaction cut — go through a **second, read-only connection**, which WAL
+/// allows to run concurrently with that writer. Three locks keep the pieces
+/// apart, and their order (never held together, except `write_mutex` briefly
+/// inside a `queue_mutex`-free region) is what keeps this deadlock-free:
+///
+///   - `queue_mutex` guards the queue and the `writing` flag. Held briefly.
+///   - `write_mutex` guards the write connection and `session` (whose
+///     `leaf_entry_id` is mutable). Held for one transaction.
+///   - `read_mutex` guards the read connection and `read_session`. Held for one
+///     read, so two reader threads can never share the connection —
+///     `SQLITE_THREADSAFE=2` forbids that.
+///
+/// A read first `flush`es: queued entries are not committed yet, so a reader
+/// would otherwise miss them. Flushing waits for the writer to drain rather than
+/// stopping it.
 pub const SessionWriter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     manager: SessionManager,
     session: Session,
+    /// Read-only connection and its own `Session` view, used by every read path.
+    read_manager: SessionManager,
+    read_session: Session,
+    /// Absolute path to the database, kept so the read connection can be opened
+    /// against the same file the write connection resolved.
+    db_path: []u8,
     mutex: std.atomic.Mutex = .unlocked,
+    write_mutex: std.atomic.Mutex = .unlocked,
+    read_mutex: std.atomic.Mutex = .unlocked,
     queue: []QueuedEntry,
     entry_queue: EntryQueue = .{},
     stopping: bool = false,
+    /// True while the writer thread is inside a transaction. Together with an
+    /// empty queue this is what `flush` waits for; without it a reader could
+    /// observe the gap between popping an entry and committing it.
+    writing: bool = false,
     title_written: bool = false,
     thread: ?std.Thread = null,
 
@@ -533,33 +502,57 @@ pub const SessionWriter = struct {
         assert(home_dir.len > 0);
         assert(cwd.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, home_dir);
+        const db_path = try defaultPath(gpa, io, home_dir);
+        errdefer gpa.free(db_path);
+        var manager = try SessionManager.init(gpa, io, db_path);
         errdefer manager.deinit();
         const session = try manager.create(cwd, .{});
-        try target.initWithSession(gpa, io, manager, session, capacity);
+        try target.initWithSession(gpa, io, manager, session, db_path, capacity);
     }
 
     pub fn initResumeDefaultWithCapacity(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, session_id: []const u8, capacity: u32) Error!void {
         assert(home_dir.len > 0);
         assert(session_id.len > 0);
         assert(capacity > 0);
-        var manager = try SessionManager.initDefault(gpa, io, home_dir);
+        const db_path = try defaultPath(gpa, io, home_dir);
+        errdefer gpa.free(db_path);
+        var manager = try SessionManager.init(gpa, io, db_path);
         errdefer manager.deinit();
         const session = try manager.@"resume"(session_id);
-        try target.initWithSession(gpa, io, manager, session, capacity);
+        try target.initWithSession(gpa, io, manager, session, db_path, capacity);
     }
 
-    fn initWithSession(target: *SessionWriter, gpa: std.mem.Allocator, io: std.Io, manager: SessionManager, session: Session, capacity: u32) Error!void {
+    /// Takes ownership of `manager`, `session`, and `db_path`. Opens the read
+    /// connection last, after `manager` has migrated the schema, so the read-only
+    /// handle never meets a database it would have to create.
+    fn initWithSession(
+        target: *SessionWriter,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        manager: SessionManager,
+        session: Session,
+        db_path: []u8,
+        capacity: u32,
+    ) Error!void {
         const queue = try gpa.alloc(QueuedEntry, capacity);
         errdefer gpa.free(queue);
+        var read_manager = try SessionManager.initRead(gpa, io, db_path);
+        errdefer read_manager.deinit();
+
         target.* = .{
             .gpa = gpa,
             .io = io,
             .manager = manager,
             .session = session,
+            .read_manager = read_manager,
+            // `leaf_entry_id` is re-synced from the write session before every
+            // read; the value here is only a placeholder.
+            .read_session = .{ .manager = undefined, .id = session.id, .leaf_entry_id = session.leaf_entry_id },
+            .db_path = db_path,
             .queue = queue,
         };
         target.session.manager = &target.manager;
+        target.read_session.manager = &target.read_manager;
         target.title_written = try target.session.hasTitle();
         target.thread = try std.Thread.spawn(.{}, runWriter, .{target});
     }
@@ -574,7 +567,11 @@ pub const SessionWriter = struct {
             owned.deinit(self.gpa);
         }
         self.gpa.free(self.queue);
+        // Read side first: it only borrows the file, and closing it before the
+        // writer keeps WAL checkpointing on close to the write connection.
+        self.read_manager.deinit();
         self.manager.deinit();
+        self.gpa.free(self.db_path);
         self.* = undefined;
     }
 
@@ -596,7 +593,7 @@ pub const SessionWriter = struct {
     /// `append`: builds the payload and hands it to the writer thread. The
     /// branch on which it lands is whatever leaf is current when the writer
     /// drains it; a stale boundary is ignored at projection time, so no
-    /// quiesce is needed here.
+    /// flush is needed here.
     pub fn appendCompaction(self: *SessionWriter, first_kept_id: []const u8, summary: []const u8) Error!void {
         assert(first_kept_id.len == entry_id_len);
         assert(summary.len > 0);
@@ -605,84 +602,62 @@ pub const SessionWriter = struct {
         try self.enqueue(.{ .kind = "compaction", .role = null, .payload_json = payload });
     }
 
-    /// Bind a git snapshot id to the current leaf entry, race-free. Flushes
-    /// queued writes first so the leaf reflects the entries the turn just wrote,
-    /// then annotates that entry. No-op if the session has no leaf yet.
-    pub fn setLeafSnapshot(self: *SessionWriter, sha: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        const leaf_id = self.session.leaf() orelse return;
-        return self.session.setSnapshot(leaf_id, sha);
-    }
-
-    /// Race-free `Session.snapshotAt`: the snapshot bound to the active
-    /// conversation position (nearest entry at/above the leaf). Caller owns it.
-    pub fn snapshotAt(self: *SessionWriter, gpa: std.mem.Allocator) Error!?SnapshotBinding {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.snapshotAt(gpa);
-    }
-
-    /// Load the whole session tree, race-free. Stops the background writer so
-    /// the read has exclusive access to the connection, then restarts it.
-    pub fn entries(self: *SessionWriter, gpa: std.mem.Allocator) Error![]EntryRecord {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.entries(gpa);
-    }
-
-    /// Reconstruct the active-path messages (leaf→root), race-free. Used after
-    /// `navigate` to rehydrate the agent's conversation from the new branch.
+    /// Reconstruct the active-path messages (root→leaf). Used after `navigate` to
+    /// rehydrate the agent's conversation from the new branch.
     pub fn messages(self: *SessionWriter, gpa: std.mem.Allocator) Error![]ai.ChatMessage {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.messages(gpa);
+        const read = try self.beginRead();
+        defer self.endRead();
+        return read.messages(gpa);
     }
 
-    /// Race-free `Session.compactionCut`: flushes queued writes so the cut is
-    /// computed against the persisted tree, then restarts the writer.
+    /// Where to cut the branch for compaction, computed against the persisted
+    /// tree.
     pub fn compactionCut(self: *SessionWriter, gpa: std.mem.Allocator, keep_recent_tokens: u32) Error!?CompactionCut {
-        self.quiesce();
-        defer self.restart() catch {};
-        return self.session.compactionCut(gpa, keep_recent_tokens);
-    }
-
-    /// Move the session leaf to `entry_id` (branch switch, no summary),
-    /// race-free with the background writer. The next appended message becomes
-    /// a child of `entry_id`, forming a new branch.
-    pub fn navigate(self: *SessionWriter, entry_id: []const u8) Error!void {
-        self.quiesce();
-        defer self.restart() catch {};
-        try self.session.branch(entry_id, null, null);
+        const read = try self.beginRead();
+        defer self.endRead();
+        return read.compactionCut(gpa, keep_recent_tokens);
     }
 
     pub fn leaf(self: *const SessionWriter) ?[]const u8 {
         return self.session.leaf();
     }
 
-    /// Stop the writer thread and flush any queued entries synchronously,
-    /// leaving the calling thread sole owner of the sqlite connection. Pair
-    /// with `restart`. Queued entries are written (not dropped) so an
-    /// in-flight assistant turn isn't lost.
-    fn quiesce(self: *SessionWriter) void {
-        lockWriter(self);
-        self.stopping = true;
-        self.mutex.unlock();
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+    /// Take the read connection and point it at the writer's current leaf.
+    ///
+    /// Flushes first: queued entries are not committed, and a WAL reader only
+    /// sees committed data. The leaf is copied under `write_mutex` because the
+    /// writer thread advances it as it drains.
+    ///
+    /// Pair every call with `endRead`.
+    fn beginRead(self: *SessionWriter) Error!*Session {
+        self.flush();
+        lock(&self.read_mutex);
+        errdefer self.read_mutex.unlock();
+        {
+            lock(&self.write_mutex);
+            defer self.write_mutex.unlock();
+            self.read_session.leaf_entry_id = self.session.leaf_entry_id;
         }
-        while (self.entry_queue.pop(self.queue)) |entry| {
-            var owned = entry;
-            defer owned.deinit(self.gpa);
-            writeQueuedEntry(self, &owned) catch {};
-        }
+        return &self.read_session;
     }
 
-    fn restart(self: *SessionWriter) Error!void {
-        assert(self.thread == null);
-        self.stopping = false;
-        self.thread = try std.Thread.spawn(.{}, runWriter, .{self});
+    fn endRead(self: *SessionWriter) void {
+        self.read_mutex.unlock();
+    }
+
+    /// Block until every queued entry has been committed.
+    ///
+    /// Replaces the old stop-the-writer-and-drain dance: the thread keeps
+    /// running, so a read no longer costs a thread teardown and respawn. Holds no
+    /// lock while waiting, so the writer is free to make progress.
+    fn flush(self: *SessionWriter) void {
+        while (true) {
+            lock(&self.mutex);
+            const drained = self.entry_queue.empty() and !self.writing;
+            self.mutex.unlock();
+            if (drained) return;
+            std.Thread.yield() catch {};
+        }
     }
 
     fn enqueue(self: *SessionWriter, entry: QueuedEntry) Error!void {
@@ -717,6 +692,10 @@ fn runWriter(writer: *SessionWriter) void {
         if (takeQueuedEntry(writer)) |entry| {
             var owned = entry;
             defer owned.deinit(writer.gpa);
+            // `writing` was set with the pop, under the queue lock, so a reader
+            // calling `flush` cannot slip into the gap between taking an entry and
+            // committing it. Clearing it is this thread's job either way.
+            defer finishWriting(writer);
             writeQueuedEntry(writer, &owned) catch continue;
         } else {
             lockWriter(writer);
@@ -731,6 +710,11 @@ fn runWriter(writer: *SessionWriter) void {
 fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!void {
     assert(entry.kind.len > 0);
     assert(entry.payload_json.len > 0);
+
+    // The write connection and `session.leaf_entry_id` are shared with the inline
+    // writers (`navigate`, `setLeafSnapshot`); one transaction at a time.
+    lock(&writer.write_mutex);
+    defer writer.write_mutex.unlock();
 
     const previous_leaf = writer.session.leaf_entry_id;
     try writer.manager.connection.exec("begin immediate");
@@ -748,37 +732,33 @@ fn writeQueuedEntry(writer: *SessionWriter, entry: *const QueuedEntry) Error!voi
     if (should_write_title) writer.title_written = true;
 }
 
+/// Pop the next entry and mark the writer busy in the same critical section, so
+/// `flush` observes "queued or being written" as one condition.
 fn takeQueuedEntry(writer: *SessionWriter) ?QueuedEntry {
     lockWriter(writer);
     defer writer.mutex.unlock();
-    return writer.entry_queue.pop(writer.queue);
+    const entry = writer.entry_queue.pop(writer.queue) orelse return null;
+    writer.writing = true;
+    return entry;
 }
 
-fn lockWriter(writer: *SessionWriter) void {
-    while (!writer.mutex.tryLock()) {
+fn finishWriting(writer: *SessionWriter) void {
+    lockWriter(writer);
+    defer writer.mutex.unlock();
+    writer.writing = false;
+}
+
+/// Spin-with-yield acquire. `std.atomic.Mutex` has no blocking `lock`, and every
+/// critical section here is short (a queue push/pop, or one small transaction).
+fn lock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
         std.Thread.yield() catch {};
     }
 }
 
-pub const EntryRecord = struct {
-    id: [entry_id_len]u8,
-    parent_id: ?[entry_id_len]u8,
-    kind: []u8,
-    role: ?[]u8,
-    payload_json: []u8,
-    created_at_ms: i64,
-    /// The git snapshot commit bound to this entry (null if none). Drives the
-    /// timeline ✦ marker and code-state restore.
-    snapshot: ?[]u8 = null,
-
-    pub fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
-        gpa.free(self.kind);
-        if (self.role) |role| gpa.free(role);
-        gpa.free(self.payload_json);
-        if (self.snapshot) |s| gpa.free(s);
-        self.* = undefined;
-    }
-};
+fn lockWriter(writer: *SessionWriter) void {
+    lock(&writer.mutex);
+}
 
 fn migrate(connection: *db.Connection, io: std.Io) Error!void {
     // Lanes share one repo-level DB; each lane's background writer holds its own
@@ -942,17 +922,6 @@ fn titleToJson(gpa: std.mem.Allocator, title: []const u8) Error![]u8 {
     return out.toOwnedSlice();
 }
 
-fn branchSummaryToJson(gpa: std.mem.Allocator, from_id: []const u8, summary: []const u8) Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try out.writer.writeAll("{\"from_id\":");
-    try std.json.Stringify.value(from_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"summary\":");
-    try std.json.Stringify.value(summary, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
 /// Emit one branch entry into the projected message list, dispatching on its
 /// kind. Compaction entries are skipped: they are represented by the summary
 /// message emitted in `messages`, not by a message of their own.
@@ -1058,18 +1027,19 @@ fn compactionSummaryText(gpa: std.mem.Allocator, payload_json: []const u8) Error
     return gpa.dupe(u8, summary.string);
 }
 
-/// Result of `compactionCut`: which entry stays as the first kept message, and
-/// the rendered prefix text to summarize. Caller owns `prefix_text`.
-/// A snapshot resolved from the tree: the git commit id, plus the entry that
-/// carries it. The entry id matters as much as the sha — it names the ref
-/// pinning this snapshot, so a caller chaining onto it knows which ref to drop.
-pub const SnapshotBinding = struct {
-    entry_id: EntryId,
-    /// git commit id. Owned by the caller.
-    sha: []u8,
+/// One row of the session tree, as read back for projection.
+pub const EntryRecord = struct {
+    id: [entry_id_len]u8,
+    parent_id: ?[entry_id_len]u8,
+    kind: []u8,
+    role: ?[]u8,
+    payload_json: []u8,
+    created_at_ms: i64,
 
-    pub fn deinit(self: *SnapshotBinding, gpa: std.mem.Allocator) void {
-        gpa.free(self.sha);
+    pub fn deinit(self: *EntryRecord, gpa: std.mem.Allocator) void {
+        gpa.free(self.kind);
+        if (self.role) |role| gpa.free(role);
+        gpa.free(self.payload_json);
         self.* = undefined;
     }
 };
@@ -1093,91 +1063,6 @@ fn renderCompactionPrefix(gpa: std.mem.Allocator, path: []const EntryRecord, bou
     defer gpa.free(rendered);
     try out.writer.writeAll(rendered);
     return out.toOwnedSlice();
-}
-
-/// Classification of a session entry, used by the `/timeline` view to drive filter
-/// modes and to hide tool-call-only assistant turns by default.
-pub const EntryKind = enum {
-    user,
-    assistant,
-    /// Assistant turn that carried only tool calls (no visible text).
-    assistant_empty,
-    tool,
-    branch_summary,
-    session_info,
-    /// Per-turn code-state checkpoint — internal metadata, hidden from the
-    /// timeline view.
-    checkpoint,
-    other,
-};
-
-pub const EntrySummary = struct {
-    kind: EntryKind,
-    tool_failed: bool = false,
-    /// One-line display text, owned by the caller.
-    text: []u8,
-};
-
-/// Classify an entry and produce its one-line `/timeline` summary in a single
-/// parse. Whitespace is collapsed and the text truncated to one row. Caller
-/// owns `text`.
-pub fn entrySummary(gpa: std.mem.Allocator, record: EntryRecord) Error!EntrySummary {
-    const display_max: u32 = 120;
-    if (std.mem.eql(u8, record.kind, "branch_summary")) {
-        return .{ .kind = .branch_summary, .text = try gpa.dupe(u8, "branch summary") };
-    }
-    if (std.mem.eql(u8, record.kind, "session_info")) {
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
-            return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
-        defer parsed.deinit();
-        if (parsed.value == .object) {
-            if (parsed.value.object.get("title")) |title| {
-                if (title == .string) {
-                    const collapsed = try collapseWhitespace(gpa, title.string, display_max);
-                    defer gpa.free(collapsed);
-                    return .{ .kind = .session_info, .text = try std.fmt.allocPrint(gpa, "title: {s}", .{collapsed}) };
-                }
-            }
-        }
-        return .{ .kind = .session_info, .text = try gpa.dupe(u8, "title") };
-    }
-    if (std.mem.eql(u8, record.kind, "checkpoint")) {
-        return .{ .kind = .checkpoint, .text = try gpa.dupe(u8, "checkpoint") };
-    }
-    if (!std.mem.eql(u8, record.kind, "message")) {
-        return .{ .kind = .other, .text = try gpa.dupe(u8, record.kind) };
-    }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, record.payload_json, .{}) catch
-        return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
-    defer parsed.deinit();
-    if (parsed.value != .object) return .{ .kind = .other, .text = try gpa.dupe(u8, "message") };
-    const object = parsed.value.object;
-
-    const role = if (object.get("role")) |value| (if (value == .string) value.string else "") else "";
-    if (std.mem.eql(u8, role, "tool")) {
-        const tool_failed = if (object.get("tool_failed")) |field| field == .bool and field.bool else false;
-        if (object.get("tool_display_label")) |label| {
-            if (label == .string and label.string.len > 0) {
-                return .{ .kind = .tool, .tool_failed = tool_failed, .text = try collapseWhitespace(gpa, label.string, display_max) };
-            }
-        }
-        return .{ .kind = .tool, .tool_failed = tool_failed, .text = try gpa.dupe(u8, "tool result") };
-    }
-
-    const is_user = std.mem.eql(u8, role, "user");
-    const prefix = if (is_user) "you: " else "agent: ";
-    const text = firstTextBlock(object);
-    if (text.len == 0) {
-        const kind: EntryKind = if (is_user) .user else .assistant_empty;
-        return .{ .kind = kind, .text = try gpa.dupe(u8, std.mem.trimEnd(u8, prefix, " :")) };
-    }
-    const collapsed = try collapseWhitespace(gpa, text, display_max);
-    defer gpa.free(collapsed);
-    return .{
-        .kind = if (is_user) .user else .assistant,
-        .text = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, collapsed }),
-    };
 }
 
 /// First `text` block of a message's content array, or "" if none.
@@ -1276,7 +1161,6 @@ fn readEntry(gpa: std.mem.Allocator, row: *const db.Row) Error!EntryRecord {
         .role = if (row.columnType(3) == .null) null else try gpa.dupe(u8, row.text(3)),
         .payload_json = try gpa.dupe(u8, row.text(4)),
         .created_at_ms = row.int(5),
-        .snapshot = if (row.columnType(6) == .null) null else try gpa.dupe(u8, row.text(6)),
     };
 }
 
@@ -1328,64 +1212,6 @@ test "session persists and loads messages" {
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(.user, messages[0].role);
     try std.testing.expectEqualStrings("hello", messages[0].text());
-}
-
-test "session persists tool display labels and failures" {
-    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "11111111111111111111111111111111", .title = "Tools" });
-
-    var id: [entry_id_len]u8 = undefined;
-    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
-    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "contents") } };
-    const call_id = try std.testing.allocator.dupe(u8, "call_1");
-    const label = try std.testing.allocator.dupe(u8, "read AGENTS.md");
-    try session.append(.{ .role = .tool, .content = blocks, .call_id = call_id, .tool_display_label = label, .tool_failed = true }, &id);
-    for (blocks) |*block| block.deinit(std.testing.allocator);
-    std.testing.allocator.free(blocks);
-    std.testing.allocator.free(call_id);
-    std.testing.allocator.free(label);
-
-    const messages = try session.messages(std.testing.allocator);
-    defer {
-        for (messages) |*message| deinitMessage(std.testing.allocator, message);
-        std.testing.allocator.free(messages);
-    }
-    try std.testing.expectEqual(@as(usize, 1), messages.len);
-    try std.testing.expectEqual(.tool, messages[0].role);
-    try std.testing.expectEqualStrings("call_1", messages[0].call_id.?);
-    try std.testing.expectEqualStrings("read AGENTS.md", messages[0].tool_display_label.?);
-    try std.testing.expect(messages[0].tool_failed);
-}
-
-test "session branch with summary changes context" {
-    var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "fedcba9876543210fedcba9876543210" });
-
-    var first: [entry_id_len]u8 = undefined;
-    var second: [entry_id_len]u8 = undefined;
-    var summary: [entry_id_len]u8 = undefined;
-    const root_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
-    root_blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "root") } };
-    try session.append(.{ .role = .user, .content = root_blocks }, &first);
-    for (root_blocks) |*block| block.deinit(std.testing.allocator);
-    std.testing.allocator.free(root_blocks);
-    const old_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
-    old_blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "old branch") } };
-    try session.append(.{ .role = .assistant, .content = old_blocks }, &second);
-    for (old_blocks) |*block| block.deinit(std.testing.allocator);
-    std.testing.allocator.free(old_blocks);
-    try session.branch(first[0..], "old branch was abandoned", &summary);
-
-    const messages = try session.messages(std.testing.allocator);
-    defer {
-        for (messages) |*message| deinitMessage(std.testing.allocator, message);
-        std.testing.allocator.free(messages);
-    }
-    try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expectEqualStrings("root", messages[0].text());
-    try std.testing.expectEqualStrings("Branch summary: old branch was abandoned", messages[1].text());
 }
 
 fn appendTextEntry(session: *Session, gpa: std.mem.Allocator, role: ai.Role, text: []const u8, id_out: *[entry_id_len]u8) !void {
@@ -1482,53 +1308,4 @@ test "compaction cut returns null when the budget covers the branch" {
     try appendTextEntry(&session, gpa, .user, "small", &id_only);
     const result = try session.compactionCut(gpa, 100_000);
     try std.testing.expect(result == null);
-}
-
-test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
-    const gpa = std.testing.allocator;
-    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
-    defer manager.deinit();
-    var session = try manager.create("/tmp/nova", .{ .id = "5" ** session_id_len });
-
-    const sha_a = "a" ** 40;
-    const sha_b = "b" ** 40;
-    var user_id: [entry_id_len]u8 = undefined;
-    var asst_id: [entry_id_len]u8 = undefined;
-    var scratch: [entry_id_len]u8 = undefined;
-
-    // No entries yet → no snapshot.
-    try std.testing.expect((try session.snapshotAt(gpa)) == null);
-
-    try appendTextEntry(&session, gpa, .user, "first", &user_id);
-    try session.setSnapshot(user_id[0..], sha_a);
-    try appendTextEntry(&session, gpa, .assistant, "second", &asst_id);
-
-    // a1 carries no snapshot → nearest ancestor (u1) wins, and the binding names
-    // u1 as the entry holding it (that entry names the pinning ref).
-    {
-        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer got.deinit(gpa);
-        try std.testing.expectEqualStrings(sha_a, got.sha);
-        try std.testing.expectEqualStrings(user_id[0..], got.entry_id.slice());
-    }
-    // Annotate the assistant entry → self wins.
-    try session.setSnapshot(asst_id[0..], sha_b);
-    {
-        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer got.deinit(gpa);
-        try std.testing.expectEqualStrings(sha_b, got.sha);
-        try std.testing.expectEqualStrings(asst_id[0..], got.entry_id.slice());
-    }
-    // Fork off u1: the new branch's leaf has no snapshot, so it inherits u1's —
-    // never a1's (which is on the other branch). This is the binding that the
-    // old descendant-checkpoint model got wrong, and it is also what makes the
-    // snapshot chain fork where the conversation forks.
-    try session.branch(user_id[0..], null, null);
-    try appendTextEntry(&session, gpa, .user, "alt", &scratch);
-    {
-        var got = (try session.snapshotAt(gpa)) orelse return error.TestFailed;
-        defer got.deinit(gpa);
-        try std.testing.expectEqualStrings(sha_a, got.sha);
-        try std.testing.expectEqualStrings(user_id[0..], got.entry_id.slice());
-    }
 }

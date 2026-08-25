@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const workspace_path = @import("workspace_path.zig");
 const edit_text = @import("edit_text.zig");
 
 const file_bytes_max: usize = 16 * 1024 * 1024;
@@ -20,7 +21,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "path",
                 .kind = .string,
-                .description = "File to write. Relative to the project unless absolute. Parent directories are created.",
+                .description = "File to write. Relative to the project unless absolute; must stay inside the project. Parent directories are created.",
                 .required = true,
             },
             .{
@@ -32,7 +33,6 @@ pub const tool: common.Tool = .{
         },
     },
     .run = run,
-    .display = display,
 };
 
 const JsonArgs = struct {
@@ -59,18 +59,22 @@ pub fn run(
         return common.failFmt(gpa, 2, "write {s}: `content` is required (pass \"\" to truncate).\n", .{path});
     };
 
-    const absolute = common.joinPath(gpa, cwd, path) catch return error.OutOfMemory;
-    defer gpa.free(absolute);
+    // `write` creates missing parents, so `resolve` does it component by component
+    // — each one re-opened without following symlinks, so a racing link is still
+    // caught instead of being created through.
+    var resolved = workspace_path.resolve(gpa, io, cwd, path, .{ .create_parents = true }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        var buffer: [512]u8 = undefined;
+        return common.failFmt(gpa, 2, "{s}\n", .{workspace_path.describe(err, "write", path, &buffer)});
+    };
+    defer resolved.deinit(gpa, io);
 
-    // Read any existing file first, so the display can show what changed rather
+    // Read any existing file first, so the result can show what changed rather
     // than just asserting a write happened. Absent file: treated as empty.
-    const previous: ?[]u8 = common.readFileBytes(gpa, io, absolute, file_bytes_max) catch null;
+    const previous: ?[]u8 = readVerified(gpa, io, &resolved) catch null;
     defer if (previous) |old| gpa.free(old);
 
-    if (std.fs.path.dirname(absolute)) |parent| {
-        std.Io.Dir.createDirPath(.cwd(), io, parent) catch {};
-    }
-    writeAll(io, absolute, content) catch {
+    writeAll(io, &resolved, content) catch {
         return common.failFmt(gpa, 2, "write {s}: could not write the file.\n", .{path});
     };
 
@@ -87,22 +91,36 @@ pub fn run(
     const after_lf = try edit_text.normalizeToLf(gpa, content);
     defer gpa.free(after_lf);
     const diff = try edit_text.renderDiff(gpa, path, before_lf, after_lf, diff_context);
-    errdefer gpa.free(diff);
+    defer gpa.free(diff);
+
+    var details: std.Io.Writer.Allocating = .init(gpa);
+    errdefer details.deinit();
+    details.writer.writeAll("{\"diff\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(diff, .{}, &details.writer) catch return error.OutOfMemory;
+    details.writer.writeByte('}') catch return error.OutOfMemory;
 
     const stderr = try gpa.alloc(u8, 0);
     return .{
         .stdout = observation,
         .stderr = stderr,
         .code = 0,
-        .display = diff,
-        .display_kind = .diff,
+        .details_json = details.toOwnedSlice() catch return error.OutOfMemory,
     };
 }
 
-fn writeAll(io: std.Io, absolute: []const u8, content: []const u8) !void {
-    var file = try std.Io.Dir.createFile(.cwd(), io, absolute, .{ .truncate = true });
+fn writeAll(io: std.Io, resolved: *const workspace_path.Resolved, content: []const u8) !void {
+    var file = try resolved.createFile(io);
     defer file.close(io);
     try file.writeStreamingAll(io, content);
+}
+
+/// Read the existing file, if any, through the verified parent handle rather than
+/// by absolute path — so a symlink planted at the target is not read through.
+fn readVerified(gpa: std.mem.Allocator, io: std.Io, resolved: *const workspace_path.Resolved) ![]u8 {
+    var file = try resolved.openFile(io);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(gpa, .limited(file_bytes_max));
 }
 
 fn lineCount(content: []const u8) usize {
@@ -115,14 +133,6 @@ fn lineCount(content: []const u8) usize {
     if (content[content.len - 1] != '\n') count += 1;
     return count;
 }
-
-pub fn display(gpa: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!common.ToolDisplay {
-    const path = try common.extractStringField(gpa, arguments, "path", "write");
-    defer gpa.free(path);
-    return .{ .label = try std.fmt.allocPrint(gpa, "Write {s}", .{path}) };
-}
-
-// === tests ==================================================================
 
 const test_dir = ".zig-cache/write-tool-test";
 
@@ -187,7 +197,7 @@ test "write over an existing file says so and diffs against the old content" {
     );
     defer output.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, output.stdout, "replaced existing file") != null);
-    const diff = output.display.?;
+    const diff = output.details_json.?;
     try std.testing.expect(std.mem.indexOf(u8, diff, "-1 before") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+1 after") != null);
 }
@@ -203,9 +213,20 @@ test "write rejects a missing content field rather than truncating" {
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "`content` is required") != null);
 }
 
-test "write display names the file" {
+test "write refuses a path that escapes the project and creates nothing" {
     const gpa = std.testing.allocator;
-    var shown = try display(gpa, "{\"path\":\"src/new.zig\"}");
-    defer shown.deinit(gpa);
-    try std.testing.expectEqualStrings("Write src/new.zig", shown.label);
+    const io = std.testing.io;
+    const outside_rel = ".zig-cache/write-escape-target.txt";
+    std.Io.Dir.cwd().deleteFile(io, outside_rel) catch {};
+
+    var output = try runInTemp(gpa, io,
+        \\{"path":"../write-escape-target.txt","content":"owned\n"}
+    );
+    defer output.deinit(gpa);
+    try std.testing.expect(output.code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "outside the workspace") != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(io, outside_rel, .{}),
+    );
 }

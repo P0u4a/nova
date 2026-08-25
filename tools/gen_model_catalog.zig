@@ -59,7 +59,11 @@ pub fn main(init: std.process.Init) !void {
         if (limit != .object) continue;
         const context = limitField(limit, "context") orelse continue;
         const output = limitField(limit, "output") orelse 0;
-        try entries.append(gpa, .{ .id = model_id, .context = context, .output = output });
+        try entries.append(gpa, .{
+            .id = model_id,
+            .context = context,
+            .output = output,
+        });
     }
 
     // Sort by id so the generated file is stable across runs (clean diffs).

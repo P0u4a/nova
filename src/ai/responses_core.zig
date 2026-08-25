@@ -191,11 +191,33 @@ pub fn writeRequestPayload(out: *std.Io.Writer, config: ai.Config, responses_con
     try std.json.Stringify.value(config.model, .{}, out);
     try out.writeAll(",\"input\":[");
     var written: u32 = 0;
-    for (messages) |message| {
-        if (config.system_prompt.len > 0 and message.role == .system) continue;
+    var index: usize = 0;
+    while (index < messages.len) {
+        const message = messages[index];
+        if (config.system_prompt.len > 0 and message.role == .system) {
+            index += 1;
+            continue;
+        }
         if (written > 0) try out.writeByte(',');
         try writeInputMessage(out, message);
         written += 1;
+
+        // `function_call_output.output` is a string, so an image a tool attached
+        // cannot travel with its result. Emit the whole run of tool outputs, then
+        // a user message carrying their images — the one place this API takes
+        // them. See `writeAttachedImages`.
+        if (message.role != .tool) {
+            index += 1;
+            continue;
+        }
+        var end = index + 1;
+        while (end < messages.len and messages[end].role == .tool) : (end += 1) {
+            try out.writeByte(',');
+            try writeInputMessage(out, messages[end]);
+            written += 1;
+        }
+        if (try writeAttachedImages(out, messages[index..end])) written += 1;
+        index = end;
     }
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
     try out.writeAll(tools_json);
@@ -299,6 +321,43 @@ fn writeToolOutput(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     try out.writeByte('}');
 }
 
+/// Follow a run of tool outputs with a user message carrying any images they
+/// attached. Returns whether anything was written, so the caller's separator
+/// bookkeeping stays right.
+///
+/// The tool outputs went out as plain strings, which is all `function_call_output`
+/// allows. Restating the images as user input is the only way a vision model sees
+/// what a tool produced; each tool result's text still stands on its own.
+fn writeAttachedImages(out: *std.Io.Writer, tool_messages: []const ai.ChatMessage) !bool {
+    var count: u32 = 0;
+    for (tool_messages) |message| {
+        for (message.content) |block| {
+            if (block != .image) continue;
+            if (count == 0) {
+                try out.writeAll(",{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":");
+                try std.json.Stringify.value(attached_images_preamble, .{}, out);
+                try out.writeByte('}');
+            }
+            try out.writeByte(',');
+            try writeInputImage(out, block.image);
+            count += 1;
+        }
+    }
+    if (count == 0) return false;
+    try out.writeAll("]}");
+    return true;
+}
+
+const attached_images_preamble = "Attached image(s) from tool result:";
+
+fn writeInputImage(out: *std.Io.Writer, image: ai.ImageBlock) !void {
+    try out.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
+    try out.writeAll(image.mime_type);
+    try out.writeAll(";base64,");
+    try out.writeAll(image.data_base64);
+    try out.writeAll("\"}");
+}
+
 fn writeInputContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void {
     try out.writeByte('[');
     var count: u32 = 0;
@@ -313,14 +372,7 @@ fn writeInputContent(out: *std.Io.Writer, blocks: []const ai.ContentBlock) !void
             },
             .image => |image| {
                 if (count > 0) try out.writeByte(',');
-                try out.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":");
-                try out.writeByte('"');
-                try out.writeAll("data:");
-                try out.writeAll(image.mime_type);
-                try out.writeAll(";base64,");
-                try out.writeAll(image.data_base64);
-                try out.writeByte('"');
-                try out.writeByte('}');
+                try writeInputImage(out, image);
                 count += 1;
             },
             .reasoning, .tool_call => {},
@@ -1001,4 +1053,65 @@ test "openresponses routes parallel argument deltas by output index" {
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", turn.assistant.content[0].tool_call.arguments);
     try std.testing.expectEqualStrings("{\"path\":\"src/main.zig\"}", turn.assistant.content[1].tool_call.arguments);
     try std.testing.expectEqualStrings("bash", turn.assistant.content[1].tool_call.name);
+}
+
+test "an image on a tool output moves into a following user message" {
+    const gpa = std.testing.allocator;
+    var blocks: [2]ai.ContentBlock = .{
+        .{ .text = .{ .text = @constCast("Attached image/png for viewing: a.png (5 bytes).") } },
+        .{ .image = .{ .mime_type = @constCast("image/png"), .data_base64 = @constCast("aGVsbG8=") } },
+    };
+    const messages = [_]ai.ChatMessage{.{
+        .role = .tool,
+        .content = &blocks,
+        .call_id = @constCast("call_1"),
+    }};
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &messages, "[]");
+    const body = payload.written();
+
+    // `function_call_output.output` is a string, so the image cannot be there.
+    const output_at = std.mem.indexOf(u8, body, "function_call_output") orelse return error.TestFailed;
+    const user_at = std.mem.indexOf(u8, body, "\"role\":\"user\"") orelse return error.TestFailed;
+    try std.testing.expect(output_at < user_at);
+    try std.testing.expect(std.mem.indexOf(u8, body[output_at..user_at], "aGVsbG8=") == null);
+
+    const user_slice = body[user_at..];
+    try std.testing.expect(std.mem.indexOf(u8, user_slice, "Attached image(s) from tool result:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_slice, "\"type\":\"input_image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_slice, "data:image/png;base64,aGVsbG8=") != null);
+}
+
+test "a tool output with no image adds no user message and no stray comma" {
+    const gpa = std.testing.allocator;
+    var blocks: [1]ai.ContentBlock = .{.{ .text = .{ .text = @constCast("done") } }};
+    const messages = [_]ai.ChatMessage{.{
+        .role = .tool,
+        .content = &blocks,
+        .call_id = @constCast("call_1"),
+    }};
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-test",
+        .session_id = "",
+        .system_prompt = "",
+        .reasoning = null,
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(&payload.writer, config, .{}, &messages, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ",,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[,") == null);
 }

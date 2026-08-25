@@ -4,11 +4,11 @@ This project uses Zig version 0.16
 
 Always consult the tigerstyle skill when writing code.
 
-## Building the TUI
+## Interface
 
-We use libvaxis vxfw for building the TUI. The source code for this library is inside zig-pkg.
-
-Prefer to use the primitives provided by the framework as much as possible.
+Nova is headless: `nova` starts a JSON-RPC server on stdin/stdout (`src/rpc.zig`).
+There is no TUI. Nothing in the agent, tools, or session layers should carry
+presentation data — a tool's output is the observation the model reads, and the RPC layer forwards it as-is.
 
 ## Zig Development
 

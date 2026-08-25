@@ -15,6 +15,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const common = @import("tools/common.zig");
+const image = @import("image.zig");
 
 const assert = std.debug.assert;
 
@@ -76,15 +77,30 @@ pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]const u8
     return list.toOwnedSlice(gpa);
 }
 
-/// `image/png` / `image/jpeg` for recognised image extensions, else null.
-pub fn mimeForPath(path: []const u8) ?[]const u8 {
-    if (endsWithIgnoreCase(path, ".png")) return "image/png";
-    if (endsWithIgnoreCase(path, ".jpg") or endsWithIgnoreCase(path, ".jpeg")) return "image/jpeg";
-    return null;
+/// The image mime type of the file `path` refers to, or null when it is not an
+/// image. Decided by sniffing the file's header, not its extension: a path is a
+/// claim and the bytes are the fact, and sending the wrong type is a provider
+/// error rather than a graceful degradation.
+///
+/// A file that cannot be opened is not an image, so an absent `@shot.png` falls
+/// through to the text path and reports the read error by name — more useful
+/// than a marker for a file that is not there.
+pub fn imageMime(io: std.Io, cwd: []const u8, path: []const u8) ?[]const u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const absolute = absoluteInto(&buffer, cwd, path) orelse return null;
+    const kind = image.detectFile(io, .cwd(), absolute) orelse return null;
+    return kind.mimeType();
 }
 
-pub fn isImagePath(path: []const u8) bool {
-    return mimeForPath(path) != null;
+/// Join `cwd` and `path` into `buffer` without allocating. Null when the result
+/// would not fit, which for a real path means it is not worth pursuing.
+fn absoluteInto(buffer: []u8, cwd: []const u8, path: []const u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        if (path.len > buffer.len) return null;
+        @memcpy(buffer[0..path.len], path);
+        return buffer[0..path.len];
+    }
+    return std.fmt.bufPrint(buffer, "{s}{c}{s}", .{ cwd, std.fs.path.sep, path }) catch null;
 }
 
 /// `prompt` followed by an embedded `<file>` block per text mention and an
@@ -105,7 +121,7 @@ pub fn buildAugmentedText(
     defer out.deinit();
     try out.writer.writeAll(prompt);
     for (mentions) |path| {
-        if (isImagePath(path)) {
+        if (imageMime(io, cwd, path) != null) {
             try out.writer.print("\n\n<image src=\"{s}\" />", .{path});
             continue;
         }
@@ -115,13 +131,15 @@ pub fn buildAugmentedText(
 }
 
 /// The content blocks for the outgoing user message: one text block (the
-/// augmented text above) followed by one image block per readable image
-/// mention. Caller owns the returned slice and every block in it.
+/// augmented text above), then one image block per readable image mention, then
+/// one per client-supplied attachment. Caller owns the returned slice and every
+/// block in it; `attached` is only borrowed and is copied here.
 pub fn buildUserMessage(
     gpa: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
     prompt: []const u8,
+    attached: []const ai.ImageBlock,
 ) ![]ai.ContentBlock {
     const text = try buildAugmentedText(gpa, io, cwd, prompt);
 
@@ -138,7 +156,7 @@ pub fn buildUserMessage(
     const mentions = try collectMentions(gpa, prompt);
     defer gpa.free(mentions);
     for (mentions) |path| {
-        const mime = mimeForPath(path) orelse continue;
+        const mime = imageMime(io, cwd, path) orelse continue;
         const absolute = common.joinPath(gpa, cwd, path) catch continue;
         defer gpa.free(absolute);
         const bytes = common.readFileBytes(gpa, io, absolute, max_image_bytes) catch continue;
@@ -149,6 +167,16 @@ pub fn buildUserMessage(
         const mime_owned = try gpa.dupe(u8, mime);
         errdefer gpa.free(mime_owned);
         try blocks.append(gpa, .{ .image = .{ .mime_type = mime_owned, .data_base64 = encoded } });
+    }
+
+    // Attachments come after the mentions so a client that both mentions a file
+    // and attaches bytes gets them in a predictable order.
+    for (attached) |attachment| {
+        const mime_owned = try gpa.dupe(u8, attachment.mime_type);
+        errdefer gpa.free(mime_owned);
+        const data_owned = try gpa.dupe(u8, attachment.data_base64);
+        errdefer gpa.free(data_owned);
+        try blocks.append(gpa, .{ .image = .{ .mime_type = mime_owned, .data_base64 = data_owned } });
     }
     return blocks.toOwnedSlice(gpa);
 }
@@ -205,11 +233,6 @@ fn containsPath(paths: []const []const u8, candidate: []const u8) bool {
     return false;
 }
 
-fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
-    if (suffix.len > value.len) return false;
-    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
-}
-
 test "activeQuery detects a mention at the cursor" {
     const active = activeQuery("explain @src/ag").?;
     try std.testing.expectEqual(@as(usize, 8), active.start);
@@ -240,11 +263,20 @@ test "collectMentions dedupes and strips trailing punctuation" {
     try std.testing.expectEqualStrings("b.png", mentions[1]);
 }
 
-test "mimeForPath maps image extensions case-insensitively" {
-    try std.testing.expectEqualStrings("image/png", mimeForPath("x.PNG").?);
-    try std.testing.expectEqualStrings("image/jpeg", mimeForPath("a/b.jpeg").?);
-    try std.testing.expectEqualStrings("image/jpeg", mimeForPath("a/b.jpg").?);
-    try std.testing.expect(mimeForPath("a/b.zig") == null);
+test "imageMime sniffs the file rather than trusting its name" {
+    const io = std.testing.io;
+    const dir_rel = ".zig-cache/at-mention-mime-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_rel);
+    try writeTestFile(io, dir_rel ++ "/real.png", "\x89PNG\r\n\x1a\nIHDR....");
+    // Named like an image, but it is source code.
+    try writeTestFile(io, dir_rel ++ "/fake.png", "const x = 1;\n");
+    // An image with no extension at all is still an image.
+    try writeTestFile(io, dir_rel ++ "/bare", "GIF89a" ++ ("\x00" ** 16));
+
+    try std.testing.expectEqualStrings("image/png", imageMime(io, dir_rel, "real.png").?);
+    try std.testing.expect(imageMime(io, dir_rel, "fake.png") == null);
+    try std.testing.expectEqualStrings("image/gif", imageMime(io, dir_rel, "bare").?);
+    try std.testing.expect(imageMime(io, dir_rel, "absent.png") == null);
 }
 
 fn writeTestFile(io: std.Io, rel_path: []const u8, data: []const u8) !void {
@@ -256,15 +288,26 @@ fn writeTestFile(io: std.Io, rel_path: []const u8, data: []const u8) !void {
     try writer.interface.flush();
 }
 
-test "buildAugmentedText notes unreadable files and marks images" {
+test "buildAugmentedText marks real images and reports unreadable files" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
-    const text = try buildAugmentedText(gpa, io, cwd, "look @nope-xyz.txt and @pic-xyz.png");
+    const dir_rel = ".zig-cache/at-mention-aug-test";
+    try std.Io.Dir.createDirPath(.cwd(), io, dir_rel);
+    try writeTestFile(io, dir_rel ++ "/pic.png", "\x89PNG\r\n\x1a\nIHDR....");
+
+    const prompt = "look @nope-xyz.txt and @" ++ dir_rel ++ "/pic.png";
+    const text = try buildAugmentedText(gpa, io, cwd, prompt);
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "<file src=\"nope-xyz.txt\" error=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "<image src=\"pic-xyz.png\" />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/pic.png\" />") != null);
+
+    // An absent `.png` is not an image — nothing sniffed it — so it reports the
+    // read error like any other missing mention instead of claiming an image.
+    const absent = try buildAugmentedText(gpa, io, cwd, "and @gone-xyz.png");
+    defer gpa.free(absent);
+    try std.testing.expect(std.mem.indexOf(u8, absent, "<file src=\"gone-xyz.png\" error=") != null);
 }
 
 test "buildUserMessage skips unreadable images" {
@@ -272,7 +315,7 @@ test "buildUserMessage skips unreadable images" {
     const io = std.testing.io;
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
-    const blocks = try buildUserMessage(gpa, io, cwd, "hi @missing-xyz.png");
+    const blocks = try buildUserMessage(gpa, io, cwd, "hi @missing-xyz.png", &.{});
     defer {
         for (blocks) |*block| block.deinit(gpa);
         gpa.free(blocks);
@@ -295,7 +338,7 @@ test "buildUserMessage embeds text files and attaches images" {
     const cwd = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(cwd);
 
-    const blocks = try buildUserMessage(gpa, io, cwd, "see @note.txt and @pixel.png");
+    const blocks = try buildUserMessage(gpa, io, cwd, "see @note.txt and @pixel.png", &.{});
     defer {
         for (blocks) |*block| block.deinit(gpa);
         gpa.free(blocks);
@@ -311,11 +354,32 @@ test "buildUserMessage embeds text files and attaches images" {
 
 test "buildUserMessage with no mentions is a lone text block" {
     const gpa = std.testing.allocator;
-    const blocks = try buildUserMessage(gpa, std.testing.io, ".", "plain prompt");
+    const blocks = try buildUserMessage(gpa, std.testing.io, ".", "plain prompt", &.{});
     defer {
         for (blocks) |*block| block.deinit(gpa);
         gpa.free(blocks);
     }
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("plain prompt", blocks[0].text.text);
+}
+
+test "attached images become blocks after any mentioned ones" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const attached = [_]ai.ImageBlock{.{
+        .mime_type = @constCast("image/webp"),
+        .data_base64 = @constCast("QUJD"),
+    }};
+    const blocks = try buildUserMessage(gpa, io, ".", "look at this", &attached);
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[0] == .text);
+    try std.testing.expect(blocks[1] == .image);
+    try std.testing.expectEqualStrings("image/webp", blocks[1].image.mime_type);
+    try std.testing.expectEqualStrings("QUJD", blocks[1].image.data_base64);
+    // Copied, not borrowed: the caller's buffers may be gone by send time.
+    try std.testing.expect(blocks[1].image.data_base64.ptr != attached[0].data_base64.ptr);
 }

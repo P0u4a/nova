@@ -25,7 +25,20 @@ uv run python export_onnx.py --model-dir /path/to/model
 Then
 
 ```sh
-zig build run
+zig build
 ```
 
 Add the binary (`zig-out/bin/nova`) to your PATH so you can invoke it from anywhere.
+
+# Usage
+
+Nova is headless. Running `nova` starts a JSON-RPC server on stdin/stdout: send it
+commands as JSON lines, read events back as JSON lines.
+
+```sh
+printf '%s\n' '{"type":"prompt","message":"what does src/agent.zig do?"}' | nova
+```
+
+Integrate this in apps and TUIs.
+
+The protocol follows Pi's RPC mode. See [docs/RPC.md](docs/RPC.md) for the commands and events Nova supports.
