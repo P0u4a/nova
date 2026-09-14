@@ -68,7 +68,7 @@ pub const ToolCallObserver = struct {
     pub fn noopStarted(_: *anyopaque, _: ai.ToolCall) anyerror!void {}
     pub fn noopFinished(_: *anyopaque, _: *const ToolResult) anyerror!void {}
     pub fn noopApproveUnsafeBash(_: *anyopaque, _: ai.ToolCall, _: []const u8) anyerror!bool {
-        return true;
+        return false;
     }
 };
 
@@ -304,6 +304,10 @@ test "executor rejected bash result is failed and model-facing" {
     defer result.deinit(gpa);
     try std.testing.expect(result.failed);
     try std.testing.expectEqualStrings("The tool call was rejected as unsafe. Try something else.", result.content);
+}
+
+test "permission without an executor approval observer rejects unsafe bash" {
+    try std.testing.expect(!try ToolCallObserver.noop.approve_unsafe_bash(undefined, undefined, "flagged command"));
 }
 
 test "executor dispatches write then edit, reporting content and details" {

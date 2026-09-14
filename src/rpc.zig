@@ -541,6 +541,82 @@ fn writeRawJsonOrString(w: *std.Io.Writer, raw: []const u8) !void {
 /// How a prompt sent while the agent is streaming should be handled.
 const StreamingBehavior = enum { steer, follow_up };
 
+/// Restores the approval rendezvous from the former TUI worker. Only the turn
+/// thread requests permission; the reader resolves it or wakes it on shutdown.
+const ApprovalGate = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    status: enum { open, cancelled, closed } = .open,
+    next_id: u32 = 0,
+    pending: ?struct { id: u32, decision: ?bool = null } = null,
+
+    fn request(self: *ApprovalGate, io: std.Io, gpa: std.mem.Allocator, out: *Output, command: []const u8) !bool {
+        assert(command.len > 0);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        assert(self.pending == null);
+        switch (self.status) {
+            .open => {},
+            .cancelled => return error.TurnCancelled,
+            .closed => return false,
+        }
+        // Never reuse an id: a delayed answer must not authorize another call.
+        self.next_id = std.math.add(u32, self.next_id, 1) catch return error.ApprovalIdExhausted;
+        self.pending = .{ .id = self.next_id };
+        defer self.pending = null;
+
+        var line: std.Io.Writer.Allocating = .init(gpa);
+        defer line.deinit();
+        try std.json.Stringify.value(.{
+            .type = "permission_request",
+            .requestId = self.next_id,
+            .toolName = "bash",
+            .command = command,
+        }, .{}, &line.writer);
+        out.writeLine(line.written());
+
+        while (self.status == .open and self.pending.?.decision == null) {
+            try self.condition.wait(io, &self.mutex);
+        }
+        if (self.status == .cancelled) return error.TurnCancelled;
+        return self.pending.?.decision orelse false;
+    }
+
+    fn resolve(self: *ApprovalGate, io: std.Io, id: u32, approved: bool) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.status != .open) return false;
+        const pending = if (self.pending) |*pending| pending else return false;
+        if (pending.id != id) return false;
+        if (pending.decision != null) return false;
+        pending.decision = approved;
+        self.condition.signal(io);
+        return true;
+    }
+
+    fn cancel(self: *ApprovalGate, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.status = .cancelled;
+        self.condition.signal(io);
+    }
+
+    fn close(self: *ApprovalGate, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.status = .closed;
+        self.condition.signal(io);
+    }
+
+    fn reset(self: *ApprovalGate, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        assert(self.pending == null);
+        assert(self.status != .closed);
+        self.status = .open;
+    }
+};
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -551,6 +627,7 @@ pub const Server = struct {
     config: config_mod.Config,
     out: Output,
     cancel: std.atomic.Value(bool) = .init(false),
+    approval: ApprovalGate = .{},
     /// The turn thread, when one is running.
     turn: ?std.Thread = null,
     /// Set by the turn thread as it finishes so the reader can join without
@@ -604,12 +681,14 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.cancel.store(true, .release);
+        self.approval.cancel(self.io);
         self.joinTurn();
         self.* = undefined;
     }
 
     /// Read commands until stdin closes.
     pub fn run(self: *Server) !void {
+        defer self.approval.close(self.io);
         var reader: LineReader = .{ .gpa = self.gpa };
         defer reader.deinit();
 
@@ -638,6 +717,9 @@ pub const Server = struct {
         // cancelling it: a one-shot invocation (`echo '{...}' | nova`) hits EOF
         // immediately after the prompt is accepted, and cancelling there would
         // discard the whole answer.
+        // No client can answer after EOF, including requests raised later in
+        // this turn. Reject those calls while letting the answer finish.
+        self.approval.close(self.io);
         self.joinTurn();
     }
 
@@ -668,6 +750,8 @@ pub const Server = struct {
             self.handleQueue(id, "follow_up", object, .follow_up);
         } else if (std.mem.eql(u8, kind, "abort")) {
             self.handleAbort(id);
+        } else if (std.mem.eql(u8, kind, "permission_response")) {
+            self.handlePermissionResponse(id, object);
         } else if (std.mem.eql(u8, kind, "get_state")) {
             self.handleGetState(id);
         } else if (std.mem.eql(u8, kind, "get_messages")) {
@@ -797,11 +881,36 @@ pub const Server = struct {
 
     fn handleAbort(self: *Server, id: ?[]const u8) void {
         self.cancel.store(true, .release);
+        self.approval.cancel(self.io);
         self.joinTurn();
         self.agent().clearQueue();
         self.cancel.store(false, .release);
         self.respondOk(id, "abort");
         self.emitQueueUpdate();
+    }
+
+    fn handlePermissionResponse(self: *Server, id: ?[]const u8, object: std.json.ObjectMap) void {
+        const request_id = object.get("requestId");
+        const approved = object.get("approved");
+        if (request_id == null or request_id.? != .integer or approved == null or approved.? != .bool) {
+            self.respondError(id, "permission_response", "`requestId` must be a positive integer and `approved` must be a boolean");
+            return;
+        }
+        const value = std.math.cast(u32, request_id.?.integer) orelse 0;
+        if (value == 0) {
+            self.respondError(id, "permission_response", "`requestId` must be a positive 32-bit integer");
+            return;
+        }
+        if (!self.approval.resolve(self.io, value, approved.?.bool)) {
+            self.respondError(id, "permission_response", "No pending permission request matches `requestId`");
+            return;
+        }
+        self.respondOk(id, "permission_response");
+    }
+
+    fn requestBashApproval(context: *anyopaque, command: []const u8) anyerror!bool {
+        const self: *Server = @ptrCast(@alignCast(context));
+        return self.approval.request(self.io, self.gpa, &self.out, command);
     }
 
     fn handleGetState(self: *Server, id: ?[]const u8) void {
@@ -991,6 +1100,7 @@ pub const Server = struct {
         job.* = .{ .server = self, .prompt = prompt, .images = images, .drain_queue = drain_queue };
         self.cancel.store(false, .release);
         self.turn_done.store(false, .release);
+        self.approval.reset(self.io);
         self.turn = try std.Thread.spawn(.{}, runTurn, .{job});
     }
 
@@ -1002,6 +1112,10 @@ pub const Server = struct {
             agent_mod.freeImages(self.gpa, job.images);
             self.gpa.destroy(job);
         }
+
+        assert(self.agent().bash_approval == null);
+        self.agent().bash_approval = .{ .ptr = self, .request = requestBashApproval };
+        defer self.agent().bash_approval = null;
 
         var writer: EventWriter = .{
             .gpa = self.gpa,
@@ -1812,4 +1926,149 @@ fn lastLine(emitted: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, emitted, "\n");
     const start = std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return trimmed;
     return trimmed[start + 1 ..];
+}
+
+/// Exercises the real RPC callback and dispatcher without a model or process.
+const PermissionHarness = struct {
+    lines: std.ArrayList(u8) = .empty,
+    server: Server = undefined,
+    worker: ?std.Thread = null,
+    result: anyerror!bool = error.RequestNotFinished,
+
+    fn init(self: *PermissionHarness) void {
+        self.* = .{};
+        self.server = .{
+            .gpa = std.testing.allocator,
+            .io = std.testing.io,
+            // Permission dispatch never reads the agent or session.
+            .runtime = undefined,
+            .session_dir = ".",
+            .config = .{},
+            .out = Output.toBuffer(std.testing.allocator, &self.lines),
+        };
+    }
+
+    fn deinit(self: *PermissionHarness) void {
+        self.server.approval.cancel(std.testing.io);
+        self.join();
+        self.server.deinit();
+        self.lines.deinit(std.testing.allocator);
+    }
+
+    fn start(self: *PermissionHarness) !u32 {
+        assert(self.worker == null);
+        self.worker = try std.Thread.spawn(.{}, request, .{self});
+        for (0..5000) |_| {
+            self.server.approval.mutex.lockUncancelable(std.testing.io);
+            const pending = self.server.approval.pending;
+            self.server.approval.mutex.unlock(std.testing.io);
+            if (pending) |value| return value.id;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.PermissionRequestTimeout;
+    }
+
+    fn request(self: *PermissionHarness) void {
+        self.result = Server.requestBashApproval(&self.server, "printf 'quoted\\path\n'");
+    }
+
+    fn join(self: *PermissionHarness) void {
+        if (self.worker) |worker| worker.join();
+        self.worker = null;
+    }
+
+    fn respond(self: *PermissionHarness, id: u32, approved: bool) !void {
+        var buffer: [160]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &buffer,
+            "{{\"id\":\"answer\",\"type\":\"permission_response\",\"requestId\":{d},\"approved\":{s}}}",
+            .{ id, if (approved) "true" else "false" },
+        );
+        self.server.dispatch(line);
+    }
+
+    fn expectResponse(self: *PermissionHarness, success: bool) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lastLine(self.lines.items), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(success, parsed.value.object.get("success").?.bool);
+        try std.testing.expectEqualStrings("permission_response", parsed.value.object.get("command").?.string);
+    }
+};
+
+test "permission RPC approves or rejects only the matching request once" {
+    var h: PermissionHarness = undefined;
+    h.init();
+    defer h.deinit();
+    var previous_id: u32 = 0;
+    for ([_]bool{ true, false }) |approved| {
+        const id = try h.start();
+        try std.testing.expect(id > previous_id);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lastLine(h.lines.items), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("permission_request", parsed.value.object.get("type").?.string);
+        try std.testing.expectEqual(id, parsed.value.object.get("requestId").?.integer);
+        try std.testing.expectEqualStrings("bash", parsed.value.object.get("toolName").?.string);
+        try std.testing.expectEqualStrings("printf 'quoted\\path\n'", parsed.value.object.get("command").?.string);
+
+        try h.respond(if (previous_id == 0) id + 1 else previous_id, true);
+        try h.expectResponse(false);
+        try h.respond(id, approved);
+        try h.expectResponse(true);
+        h.join();
+        try std.testing.expectEqual(approved, try h.result);
+        try h.respond(id, !approved);
+        try h.expectResponse(false);
+        previous_id = id;
+    }
+}
+
+test "permission RPC rejects malformed decisions without resolving the request" {
+    var h: PermissionHarness = undefined;
+    h.init();
+    defer h.deinit();
+    const id = try h.start();
+    const fields = [_][]const u8{
+        "",                                     ",\"requestId\":1",                      ",\"requestId\":1,\"approved\":\"true\"",
+        ",\"requestId\":0,\"approved\":true",   ",\"requestId\":-1,\"approved\":true",   ",\"requestId\":4294967296,\"approved\":true",
+        ",\"requestId\":1.5,\"approved\":true", ",\"requestId\":null,\"approved\":true", ",\"requestId\":1,\"approved\":null",
+    };
+    for (fields) |field| {
+        var buffer: [160]u8 = undefined;
+        h.server.dispatch(try std.fmt.bufPrint(&buffer, "{{\"type\":\"permission_response\"{s}}}", .{field}));
+        try h.expectResponse(false);
+    }
+    try h.respond(id, false);
+    h.join();
+    try std.testing.expect(!try h.result);
+}
+
+test "permission cancellation wakes the worker and cannot spill into the next turn" {
+    var h: PermissionHarness = undefined;
+    h.init();
+    defer h.deinit();
+    const old_id = try h.start();
+    h.server.approval.cancel(std.testing.io);
+    h.join();
+    try std.testing.expectError(error.TurnCancelled, h.result);
+    try std.testing.expectError(error.TurnCancelled, Server.requestBashApproval(&h.server, "late request"));
+    h.server.approval.reset(std.testing.io);
+    const id = try h.start();
+    try h.respond(old_id, true);
+    try h.expectResponse(false);
+    try h.respond(id, true);
+    h.join();
+    try std.testing.expect(try h.result);
+}
+
+test "permission EOF rejects both pending and future requests" {
+    var h: PermissionHarness = undefined;
+    h.init();
+    defer h.deinit();
+    const id = try h.start();
+    h.server.approval.close(std.testing.io);
+    h.join();
+    try std.testing.expect(!try h.result);
+    try std.testing.expect(!try Server.requestBashApproval(&h.server, "late request"));
+    try h.respond(id, true);
+    try h.expectResponse(false);
 }

@@ -159,7 +159,7 @@ pub const Agent = struct {
     compaction_client: ai.LanguageModel = .none,
     /// Optional local classifier endpoint for bash approval gating.
     bash_classifier_url: ?[]const u8 = null,
-    /// Optional synchronous approval hook used by the TUI worker.
+    /// Optional synchronous approval hook; the RPC server waits for the client.
     bash_approval: ?BashApproval = null,
     /// Optional shared manager for long-running bash commands launched with
     /// `run_in_background`. Borrowed (owned by the App); null disables the
